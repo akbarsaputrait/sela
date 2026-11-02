@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "auxiliary",
+  "description": "Base webview APIs for the trusted quick-add and alert windows.",
+  "windows": ["capture", "alert"],
+  "permissions": ["core:default"]
+}

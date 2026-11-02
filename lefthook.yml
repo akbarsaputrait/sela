@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://lefthook.dev/schema.json
+
+pre-commit:
+  parallel: false
+  jobs:
+    - name: format-staged-typescript
+      glob:
+        - "*.ts"
+        - "*.tsx"
+      run: bunx --no-install oxfmt {staged_files}
+      stage_fixed: true
+
+    - name: lint-staged-typescript
+      glob:
+        - "*.ts"
+        - "*.tsx"
+      run: bunx --no-install oxlint {staged_files}

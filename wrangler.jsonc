@@ -1,0 +1,9 @@
+{
+  "name": "sela",
+  "compatibility_date": "2026-10-31",
+  "assets": {
+    "directory": "./dist-website",
+    "base_path": "/",
+    "not_found_handling": "single-page-application",
+  },
+}
