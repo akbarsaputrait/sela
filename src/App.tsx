@@ -2,10 +2,13 @@ import { useState } from "react"
 
 import { ThemeSync } from "@/app/theme-sync"
 import { useNativeState, type NativeState } from "@/app/use-native-state"
+import { AppError } from "@/components/app-error"
 import { Onboarding } from "@/features/onboarding/onboarding"
 import { ReminderAlert } from "@/features/alert/reminder-alert"
 import { Dashboard } from "@/features/dashboard/dashboard"
 import { QuickAdd } from "@/features/quick-add/quick-add"
+import { isTauri } from "@/lib/tauri"
+import { isDashboardPreview } from "@/lib/preview"
 
 export type WindowRoute = "main" | "capture" | "alert"
 
@@ -14,30 +17,50 @@ export function route(): WindowRoute {
   return requested === "capture" || requested === "alert" ? requested : "main"
 }
 
-function MainWindow({ nativeState }: { nativeState: NativeState }) {
-  const { snapshot, loading, error, command } = nativeState
+function StartupState({ nativeState }: { nativeState: NativeState }) {
+  return (
+    <main className="p-8">
+      <h1 className="text-2xl font-semibold">Sela</h1>
+      {nativeState.loading ? (
+        <p className="mt-2 text-sm text-muted-foreground">
+          Opening your reminders…
+        </p>
+      ) : (
+        <div className="mt-4">
+          <AppError
+            title="Your reminders couldn’t be opened"
+            message={
+              nativeState.error ?? "Please try opening your reminders again."
+            }
+            onRetry={() => void nativeState.refresh()}
+          />
+        </div>
+      )}
+    </main>
+  )
+}
+
+export function MainWindow({ nativeState }: { nativeState: NativeState }) {
+  const { snapshot, initialized, error, command } = nativeState
   const [onboardingError, setOnboardingError] = useState<string | null>(null)
-  const previewDashboard =
-    import.meta.env.DEV &&
-    new URLSearchParams(window.location.search).get("preview") === "dashboard"
-  if (!loading && !snapshot.settings.onboardingCompleted && !previewDashboard) {
+  const previewDashboard = isDashboardPreview(
+    window.location.search,
+    import.meta.env.DEV,
+    isTauri()
+  )
+  if (!initialized) return <StartupState nativeState={nativeState} />
+  if (
+    !snapshot.settings.onboardingCompleted &&
+    !previewDashboard &&
+    !snapshot.storageError
+  ) {
     return (
       <Onboarding
         snapshot={snapshot}
         command={command}
-        error={onboardingError ?? error ?? snapshot.storageError}
+        error={onboardingError ?? error}
         onError={setOnboardingError}
       />
-    )
-  }
-  if (loading) {
-    return (
-      <main className="p-8">
-        <h1 className="text-2xl font-semibold">Sela</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Opening your reminders…
-        </p>
-      </main>
     )
   }
   return <Dashboard nativeState={nativeState} />
@@ -46,7 +69,7 @@ function MainWindow({ nativeState }: { nativeState: NativeState }) {
 export default function App() {
   const current = route()
   const nativeState = useNativeState()
-  const { snapshot, loading, command } = nativeState
+  const { snapshot, initialized, command } = nativeState
   return (
     <>
       <ThemeSync
@@ -56,7 +79,9 @@ export default function App() {
       {current === "capture" ? (
         <QuickAdd command={command} />
       ) : current === "alert" ? (
-        loading ? null : (
+        !initialized ? (
+          <StartupState nativeState={nativeState} />
+        ) : (
           <ReminderAlert nativeState={nativeState} />
         )
       ) : (

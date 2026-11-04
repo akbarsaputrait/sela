@@ -322,6 +322,107 @@ impl Document {
         Ok(())
     }
 
+    /// Replace timing atomically without discarding recorded calendar occurrences.
+    pub fn edit_timer(
+        &mut self,
+        id: &str,
+        title: &str,
+        duration_ms: Option<u64>,
+        now: u64,
+    ) -> Result<(), DomainError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(DomainError::EmptyReminder);
+        }
+        if title.chars().count() > MAX_TITLE_CHARS {
+            return Err(DomainError::TitleTooLong);
+        }
+        let due_at = duration_ms
+            .map(|duration| deadline(now, duration))
+            .transpose()?;
+        if due_at.is_some_and(|due| due > i64::MAX as u64) {
+            return Err(DomainError::InvalidDuration);
+        }
+        let reminder = self.pending_mut(id)?;
+        let revision = next_revision(reminder)?;
+        reminder.title = title.into();
+        reminder.due_at = due_at;
+        reminder.schedule = None;
+        reminder.snoozed_until = None;
+        reminder.occurrence_revision = revision;
+        Ok(())
+    }
+
+    /// Explicitly discard resolved rows only; pending occurrence history is retained.
+    pub fn clear_resolved_history(&mut self) -> usize {
+        let before = self.reminders.len();
+        self.reminders
+            .retain(|reminder| reminder.status == ReminderStatus::Pending);
+        before - self.reminders.len()
+    }
+
+    /// Reopen a resolved reminder or detach one completed occurrence without
+    /// replacing a recurring reminder's current occurrence.
+    pub fn reopen(
+        &mut self,
+        id: &str,
+        expected_revision: u64,
+        occurrence: Option<(usize, u64)>,
+        now: u64,
+    ) -> Result<(), DomainError> {
+        let index = self
+            .reminders
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or(DomainError::ReminderUnavailable)?;
+        let reminder = &self.reminders[index];
+        if reminder.occurrence_revision != expected_revision {
+            return Err(DomainError::ReminderUnavailable);
+        }
+        let revision = next_revision(reminder)?;
+        if let Some((history_index, timestamp)) = occurrence {
+            if reminder.occurrence_history.get(history_index) != Some(&timestamp) {
+                return Err(DomainError::ReminderUnavailable);
+            }
+            if self.reminders.len() >= MAX_REMINDERS {
+                return Err(DomainError::CapacityReached);
+            }
+            let title = reminder.title.clone();
+            self.reminders[index]
+                .occurrence_history
+                .remove(history_index);
+            self.reminders[index].occurrence_revision = revision;
+            self.reminders.push(Reminder {
+                id: Uuid::new_v4().to_string(),
+                title,
+                created_at: now,
+                due_at: Some(timestamp),
+                status: ReminderStatus::Pending,
+                resolved_at: None,
+                apple_reminder_id: None,
+                schedule: None,
+                snoozed_until: None,
+                occurrence_revision: 0,
+                occurrence_history: Vec::new(),
+            });
+        } else {
+            let reminder = &mut self.reminders[index];
+            if reminder.status == ReminderStatus::Pending {
+                return Err(DomainError::ReminderUnavailable);
+            }
+            if reminder.status == ReminderStatus::Completed
+                && reminder.schedule.is_some()
+                && reminder.occurrence_history.last().copied() == reminder.due_at
+            {
+                reminder.occurrence_history.pop();
+            }
+            reminder.status = ReminderStatus::Pending;
+            reminder.resolved_at = None;
+            reminder.occurrence_revision = revision;
+        }
+        Ok(())
+    }
+
     pub fn edit_scheduled(
         &mut self,
         id: &str,
@@ -485,6 +586,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reopening_resolved_reminders_preserves_timing_and_rejects_stale_actions() {
+        let mut document = Document::default();
+        let id = document.create("timer", Some(60_000), 1_000).unwrap();
+        document
+            .resolve(&id, ReminderStatus::Cancelled, 2_000)
+            .unwrap();
+        let revision = document.reminders[0].occurrence_revision;
+        document.reopen(&id, revision, None, 3_000).unwrap();
+        assert_eq!(document.reminders[0].due_at, Some(61_000));
+        assert_eq!(document.reminders[0].status, ReminderStatus::Pending);
+        assert_eq!(document.reminders[0].resolved_at, None);
+        assert!(document.reopen(&id, revision, None, 3_000).is_err());
+    }
+
+    #[test]
+    fn reopening_occurrence_consumes_history_without_overwriting_series() {
+        let schedule: Schedule = serde_json::from_str(r#"{"kind":"daily","date":"2025-01-01","time":"09:00","weekdays":[],"dates":[],"endDate":null,"timeZone":"UTC"}"#).unwrap();
+        let mut document = Document::default();
+        let now = 1_735_689_600_000;
+        let id = document
+            .create_scheduled("daily", schedule.clone(), now)
+            .unwrap();
+        let due = document.reminders[0].due_at.unwrap();
+        document
+            .resolve(&id, ReminderStatus::Completed, due)
+            .unwrap();
+        let revision = document.reminders[0].occurrence_revision;
+        let next = document.reminders[0].due_at;
+        assert!(
+            document
+                .reopen(&id, revision, Some((0, due + 1)), due)
+                .is_err()
+        );
+        document
+            .reopen(&id, revision, Some((0, due)), due + 1)
+            .unwrap();
+        assert_eq!(document.reminders[0].due_at, next);
+        assert_eq!(document.reminders[0].schedule, Some(schedule));
+        assert!(document.reminders[0].occurrence_history.is_empty());
+        assert_eq!(document.reminders[1].due_at, Some(due));
+        assert_eq!(document.reminders[1].schedule, None);
+        assert!(
+            document
+                .reopen(&id, revision, Some((0, due)), due + 1)
+                .is_err()
+        );
+        assert_eq!(document.reminders.len(), 2);
+    }
+
+    #[test]
+    fn reopening_terminal_scheduled_reminder_unrecords_its_last_completion() {
+        let schedule: Schedule = serde_json::from_str(r#"{"kind":"daily","date":"2025-01-01","time":"09:00","weekdays":[],"dates":[],"endDate":"2025-01-01","timeZone":"UTC"}"#).unwrap();
+        let mut document = Document::default();
+        let now = 1_735_689_600_000;
+        let id = document
+            .create_scheduled("last", schedule.clone(), now)
+            .unwrap();
+        let due = document.reminders[0].due_at.unwrap();
+        document
+            .resolve(&id, ReminderStatus::Completed, due)
+            .unwrap();
+        let revision = document.reminders[0].occurrence_revision;
+        document.reopen(&id, revision, None, due + 1).unwrap();
+        assert_eq!(document.reminders[0].schedule, Some(schedule));
+        assert_eq!(document.reminders[0].due_at, Some(due));
+        assert!(document.reminders[0].occurrence_history.is_empty());
+        assert_eq!(document.reminders[0].status, ReminderStatus::Pending);
+    }
+
+    #[test]
     fn recurring_completion_and_snooze_preserve_occurrence() {
         let schedule: Schedule = serde_json::from_str(r#"{"kind":"daily","date":"2025-01-01","time":"09:00","weekdays":[],"dates":[],"endDate":null,"timeZone":"UTC"}"#).unwrap();
         let now = 1_735_689_600_000;
@@ -597,6 +768,105 @@ mod tests {
             .unwrap();
         assert_eq!(document.reminders[0].resolved_at, Some(500));
         assert!(document.reschedule(&id, 1_000, 600).is_err());
+    }
+
+    #[test]
+    fn replacing_calendar_timing_keeps_history_and_clears_snooze() {
+        let schedule: Schedule = serde_json::from_str(r#"{"kind":"daily","date":"2025-01-01","time":"09:00","weekdays":[],"dates":[],"endDate":null,"timeZone":"UTC"}"#).unwrap();
+        let mut document = Document::default();
+        let now = 1_735_689_600_000;
+        let id = document
+            .create_scheduled("calendar", schedule, now)
+            .unwrap();
+        let due = document.reminders[0].due_at.unwrap();
+        document
+            .resolve(&id, ReminderStatus::Completed, due)
+            .unwrap();
+        document.snooze(&id, 60_000, due).unwrap();
+        document
+            .edit_timer(&id, " replacement ", Some(5_000), due)
+            .unwrap();
+        let reminder = &document.reminders[0];
+        assert_eq!(reminder.title, "replacement");
+        assert_eq!(reminder.due_at, Some(due + 5_000));
+        assert_eq!(reminder.schedule, None);
+        assert_eq!(reminder.snoozed_until, None);
+        assert_eq!(reminder.occurrence_revision, 3);
+        assert_eq!(reminder.occurrence_history, vec![due]);
+        document.edit_timer(&id, "untimed", None, due).unwrap();
+        assert_eq!(document.reminders[0].due_at, None);
+        assert_eq!(document.reminders[0].occurrence_history, vec![due]);
+        assert_eq!(document.reminders[0].occurrence_revision, 4);
+        document
+            .edit_timer(&id, "timer again", Some(1_000), due)
+            .unwrap();
+        assert_eq!(document.reminders[0].due_at, Some(due + 1_000));
+    }
+
+    #[test]
+    fn timer_edit_validation_is_atomic_and_rejects_finished_rows() {
+        let mut document = Document::default();
+        let id = document.create("original", Some(1_000), 100).unwrap();
+        for (title, duration, now) in [
+            ("", None, 100),
+            ("changed", Some(999), 100),
+            ("changed", Some(MAX_DURATION_MS + 1), 100),
+            ("changed", Some(1_000), i64::MAX as u64),
+        ] {
+            let before = document.clone();
+            assert!(document.edit_timer(&id, title, duration, now).is_err());
+            assert_eq!(document, before);
+        }
+        let before = document.clone();
+        assert_eq!(
+            document.edit_timer(&id, &"a".repeat(MAX_TITLE_CHARS + 1), None, 100),
+            Err(DomainError::TitleTooLong)
+        );
+        assert_eq!(document, before);
+        document.reminders[0].occurrence_revision = i64::MAX as u64;
+        let before = document.clone();
+        assert_eq!(
+            document.edit_timer(&id, "overflow", None, 100),
+            Err(DomainError::InvalidDocument)
+        );
+        assert_eq!(document, before);
+        document.reminders[0].occurrence_revision = 0;
+        document
+            .resolve(&id, ReminderStatus::Completed, 200)
+            .unwrap();
+        assert_eq!(
+            document.edit_timer(&id, "finished", None, 300),
+            Err(DomainError::ReminderUnavailable)
+        );
+    }
+
+    #[test]
+    fn explicit_history_deletion_recovers_capacity_without_changing_pending_rows() {
+        let mut document = Document::default();
+        let pending = document.create("keep history", None, 100).unwrap();
+        document.reminders[0].occurrence_history = vec![50];
+        let retained = document.reminders[0].clone();
+        for index in 1..MAX_REMINDERS {
+            let id = document.create("resolved", None, 100).unwrap();
+            let status = if index % 2 == 0 {
+                ReminderStatus::Completed
+            } else {
+                ReminderStatus::Cancelled
+            };
+            document.resolve(&id, status, 200).unwrap();
+        }
+        assert_eq!(
+            document.create("full", None, 300),
+            Err(DomainError::CapacityReached)
+        );
+        assert_eq!(document.reminders.len(), MAX_REMINDERS);
+        assert_eq!(document.clear_resolved_history(), MAX_REMINDERS - 1);
+        assert_eq!(document.reminders, vec![retained]);
+        assert_eq!(document.reminders[0].id, pending);
+        assert_eq!(document.clear_resolved_history(), 0);
+        document.create("new capacity", Some(1_000), 300).unwrap();
+        assert_eq!(document.reminders.len(), 2);
+        assert_eq!(document.reminders[0].occurrence_history, vec![50]);
     }
 
     #[test]

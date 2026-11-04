@@ -1,11 +1,21 @@
 import { describe, expect, it, vi } from "vitest"
 
+import fixturesJson from "./schedule-fixtures.json?raw"
 import {
+  MAX_SELECTED_DATES,
   editScheduleValues,
   localDateTime,
   resolveSchedule,
   type ScheduleFormValues,
+  type ReminderSchedule,
 } from "./schedule"
+
+const fixtures = JSON.parse(fixturesJson) as {
+  name: string
+  schedule: ReminderSchedule
+  after: string
+  expected: string | null
+}[]
 
 const now = new Date(2030, 0, 7, 10, 0) // Monday
 const base: ScheduleFormValues = {
@@ -18,6 +28,45 @@ const base: ScheduleFormValues = {
 }
 
 describe("schedule resolution", () => {
+  it.each(fixtures)("$name matches the shared expected instant", (fixture) => {
+    vi.stubEnv("TZ", fixture.schedule.timeZone)
+    try {
+      const result = resolveSchedule(
+        {
+          ...fixture.schedule,
+          kind: fixture.schedule.kind as ScheduleFormValues["kind"],
+          endDate: fixture.schedule.endDate ?? "",
+        },
+        new Date(fixture.after)
+      )
+      expect(result.schedule?.nextOccurrence.getTime() ?? null).toBe(
+        fixture.expected === null ? null : Date.parse(fixture.expected)
+      )
+      if (fixture.expected === null)
+        expect(result.errors.length).toBeGreaterThan(0)
+      else expect(result.errors).toEqual([])
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it("accepts the selected-date limit and rejects over-cap selections", () => {
+    const values: ScheduleFormValues = {
+      ...base,
+      kind: "dates",
+      dates: Array.from({ length: MAX_SELECTED_DATES }, () => "2030-01-08"),
+    }
+    expect(resolveSchedule(values, now).schedule?.values.dates).toEqual([
+      "2030-01-08",
+    ])
+    expect(
+      resolveSchedule(
+        { ...values, dates: [...values.dates, "2030-01-09"] },
+        now
+      ).errors
+    ).toContain("Choose no more than 10,000 dates.")
+  })
+
   it("resolves a local one-time date and rejects past times and invalid dates", () => {
     expect(resolveSchedule(base, now).schedule?.nextOccurrence).toEqual(
       new Date(2030, 0, 7, 11)

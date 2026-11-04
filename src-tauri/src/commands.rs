@@ -45,6 +45,11 @@ pub fn get_snapshot(window: tauri::WebviewWindow, runtime: State<'_, Arc<AppRunt
 }
 
 #[tauri::command]
+pub async fn get_notification_permission() -> Result<&'static str, String> {
+    notifications::authorization_status().await
+}
+
+#[tauri::command]
 pub async fn create_reminder(
     app: tauri::AppHandle,
     runtime: State<'_, Arc<AppRuntime>>,
@@ -83,6 +88,93 @@ pub async fn create_scheduled_reminder(
 }
 
 #[tauri::command]
+pub fn take_requested_dashboard_tab(
+    window: tauri::WebviewWindow,
+    runtime: State<'_, Arc<AppRuntime>>,
+) -> Option<String> {
+    if window.label() == "main" {
+        runtime.take_requested_dashboard_tab()
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+pub fn resize_capture(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    scheduled: bool,
+) -> Result<(), String> {
+    if window.label() != "capture" {
+        return Err("Only Quick Add can resize its window.".into());
+    }
+    windows::resize_capture(&app, scheduled).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_resolved_history(
+    app: tauri::AppHandle,
+    runtime: State<'_, Arc<AppRuntime>>,
+) -> Result<usize, String> {
+    let count = runtime
+        .mutate_document(|document| Ok(document.clear_resolved_history()))
+        .await?;
+    publish_and_present(&app);
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn reopen_reminder(
+    app: tauri::AppHandle,
+    runtime: State<'_, Arc<AppRuntime>>,
+    id: String,
+    expected_occurrence_revision: u64,
+    occurrence_index: Option<usize>,
+    occurrence_timestamp: Option<u64>,
+) -> Result<(), String> {
+    let occurrence = match (occurrence_index, occurrence_timestamp) {
+        (Some(index), Some(timestamp)) => Some((index, timestamp)),
+        (None, None) => None,
+        _ => return Err("This reminder changed. Please review it and try again.".into()),
+    };
+    runtime
+        .mutate_document(move |document| {
+            document
+                .reopen(
+                    &id,
+                    expected_occurrence_revision,
+                    occurrence,
+                    unix_timestamp(),
+                )
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+    publish_and_present(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn edit_timer_reminder(
+    app: tauri::AppHandle,
+    runtime: State<'_, Arc<AppRuntime>>,
+    id: String,
+    title: String,
+    duration_ms: Option<u64>,
+    expected_occurrence_revision: u64,
+) -> Result<(), String> {
+    let transition_id = id.clone();
+    runtime
+        .mutate_occurrence_reminder(id, expected_occurrence_revision, move |document| {
+            document
+                .edit_timer(&transition_id, &title, duration_ms, unix_timestamp())
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+    publish_and_present(&app);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn rename_reminder(
     app: tauri::AppHandle,
     runtime: State<'_, Arc<AppRuntime>>,
@@ -111,15 +203,11 @@ pub async fn edit_scheduled_reminder(
     schedule: crate::scheduling::Schedule,
     expected_occurrence_revision: u64,
 ) -> Result<(), String> {
+    let transition_id = id.clone();
     runtime
-        .mutate_document(move |document| {
-            if !document.reminders.iter().any(|reminder| {
-                reminder.id == id && reminder.occurrence_revision == expected_occurrence_revision
-            }) {
-                return Err("That reminder just changed. Here’s the latest.".into());
-            }
+        .mutate_occurrence_reminder(id, expected_occurrence_revision, move |document| {
             document
-                .edit_scheduled(&id, &title, schedule, unix_timestamp())
+                .edit_scheduled(&transition_id, &title, schedule, unix_timestamp())
                 .map_err(|error| error.to_string())
         })
         .await?;
@@ -215,7 +303,7 @@ pub async fn set_alert_style(
             Ok(())
         })
         .await?;
-    runtime.retry_failed_deliveries(unix_timestamp()).await;
+    runtime.retry_failed_deliveries().await;
     publish_and_present(&app);
     Ok(())
 }
@@ -225,62 +313,9 @@ pub async fn retry_failed_deliveries(
     app: tauri::AppHandle,
     runtime: State<'_, Arc<AppRuntime>>,
 ) -> Result<(), String> {
-    runtime.retry_failed_deliveries(unix_timestamp()).await;
+    runtime.retry_failed_deliveries().await;
     publish_and_present(&app);
     Ok(())
-}
-
-const MAX_CUSTOM_SOUND_BYTES: usize = 8 * 1024 * 1024;
-
-fn valid_wav(bytes: &[u8]) -> bool {
-    if bytes.len() < 12
-        || bytes.len() > MAX_CUSTOM_SOUND_BYTES
-        || &bytes[0..4] != b"RIFF"
-        || &bytes[8..12] != b"WAVE"
-    {
-        return false;
-    }
-    let total = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize + 8;
-    if total != bytes.len() {
-        return false;
-    }
-    let (mut offset, mut format, mut data) = (12usize, false, false);
-    while offset + 8 <= total {
-        let size = u32::from_le_bytes([
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]) as usize;
-        let Some(end) = offset
-            .checked_add(8)
-            .and_then(|value| value.checked_add(size))
-        else {
-            return false;
-        };
-        if end > total {
-            return false;
-        }
-        if &bytes[offset..offset + 4] == b"fmt " && size >= 16 {
-            format = true;
-        }
-        if &bytes[offset..offset + 4] == b"data" && size > 0 {
-            data = true;
-        }
-        offset = end + (size % 2);
-    }
-    format && data && offset == total
-}
-
-fn custom_sound_path(app: &tauri::AppHandle, id: &str) -> Result<std::path::PathBuf, String> {
-    let id = uuid::Uuid::parse_str(id)
-        .map_err(|_| "That sound is unavailable. Upload it again.".to_string())?;
-    let root = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "The sound folder is unavailable.".to_string())?
-        .join("sounds");
-    Ok(root.join(format!("{id}.wav")))
 }
 
 #[tauri::command]
@@ -302,67 +337,23 @@ pub async fn set_sound_choice(
     Ok(())
 }
 
-fn write_custom_sound(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    if !valid_wav(bytes) {
-        return Err("Choose a valid WAV file no larger than 8 MB.".into());
-    }
-    let parent = path.parent().ok_or("The sound folder is unavailable.")?;
-    std::fs::create_dir_all(parent)
-        .map_err(|_| "The sound couldn't be saved. Check available disk space.".to_string())?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|_| "The sound couldn't be saved. Check available disk space.".to_string())?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(path);
-        return Err("The sound couldn't be saved. Check available disk space.".into());
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn upload_custom_sound(
     app: tauri::AppHandle,
     runtime: State<'_, Arc<AppRuntime>>,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let path = custom_sound_path(&app, &id)?;
-    write_custom_sound(&path, &bytes)?;
-    let sound_id = id.clone();
-    let result = runtime
-        .mutate_document(move |document| {
-            document.settings.custom_sound_id = Some(id);
-            document.settings.sound_choice = SoundChoice::Custom;
-            Ok(())
-        })
-        .await;
-    if result.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    result?;
+    let sound_id = runtime.upload_custom_sound(bytes).await?;
     publish(&app);
     Ok(sound_id)
 }
 
 #[tauri::command]
-pub fn get_custom_sound(app: tauri::AppHandle, id: String) -> Result<Vec<u8>, String> {
-    let path = custom_sound_path(&app, &id)?;
-    let metadata = std::fs::metadata(&path)
-        .map_err(|_| "That sound is unavailable. Upload it again.".to_string())?;
-    if metadata.len() > MAX_CUSTOM_SOUND_BYTES as u64 {
-        return Err("That sound is too large. Upload it again.".into());
-    }
-    std::fs::read(path).map_err(|_| "That sound is unavailable. Upload it again.".into())
+pub async fn get_custom_sound(
+    runtime: State<'_, Arc<AppRuntime>>,
+    id: String,
+) -> Result<Vec<u8>, String> {
+    runtime.get_custom_sound(id).await
 }
 
 #[tauri::command]
@@ -516,7 +507,7 @@ pub fn hide_dashboard(app: tauri::AppHandle) {
 
 pub async fn handle_notification_action(
     app: &tauri::AppHandle,
-    action: &str,
+    action: notifications::ReminderAction,
     id: &str,
     due_at: Option<u64>,
     occurrence_revision: Option<u64>,
@@ -533,7 +524,7 @@ pub async fn handle_notification_action(
     let runtime = app.state::<Arc<AppRuntime>>();
     let id = id.to_owned();
     let result = match action {
-        "done" => {
+        notifications::ReminderAction::Done => {
             runtime
                 .mutate_notification_reminder(
                     id.clone(),
@@ -543,7 +534,7 @@ pub async fn handle_notification_action(
                 )
                 .await
         }
-        "snooze" => {
+        notifications::ReminderAction::Snooze => {
             runtime
                 .mutate_notification_reminder(
                     id.clone(),
@@ -552,10 +543,6 @@ pub async fn handle_notification_action(
                     reminder_transition(id.clone(), "snooze".into(), Some(5 * 60_000)),
                 )
                 .await
-        }
-        _ => {
-            windows::open_dashboard(app);
-            return;
         }
     };
     if let Err(error) = result {
@@ -602,47 +589,27 @@ fn present(app: &tauri::AppHandle) {
 
     if snapshot.settings.alert_style == AlertStyle::Native {
         if runtime.reserve_notification(snapshot.alert_token) {
-            #[cfg(debug_assertions)]
-            if std::env::args().any(|argument| argument == "--smoke-test") {
-                // Never post a real macOS banner from the automated smoke test. In dev mode
-                // notify-rust attributes the banner to Terminal, not to Sela's bundle.
-                let app = app.clone();
-                let runtime = Arc::clone(&runtime);
-                let token = snapshot.alert_token;
-                tauri::async_runtime::spawn(async move {
-                    runtime
-                        .handoff_native_notification(token, unix_timestamp())
-                        .await;
+            let app = app.clone();
+            let runtime = Arc::clone(&runtime);
+            let token = snapshot.alert_token;
+            tauri::async_runtime::spawn(async move {
+                #[cfg(debug_assertions)]
+                if std::env::args().any(|argument| argument == "--smoke-test") {
+                    // Harness-only simulated submission/queue handoff. Never initialize
+                    // UserNotifications, request permission or post a real banner here.
+                    log::info!("smoke: simulated native submission/queue handoff");
+                    notifications::deliver(&runtime, token, std::future::ready(Ok(()))).await;
                     publish(&app);
-                });
-                return;
-            }
-            match notifications::send(app, &snapshot) {
-                Ok(()) => {
-                    let app = app.clone();
-                    let runtime = Arc::clone(&runtime);
-                    let token = snapshot.alert_token;
-                    tauri::async_runtime::spawn(async move {
-                        runtime
-                            .handoff_native_notification(token, unix_timestamp())
-                            .await;
-                        runtime.set_delivery_error(None);
-                        publish(&app);
-                    });
+                    return;
                 }
-                Err(message) => {
-                    let app = app.clone();
-                    let runtime = Arc::clone(&runtime);
-                    let token = snapshot.alert_token;
-                    tauri::async_runtime::spawn(async move {
-                        runtime
-                            .fail_active_delivery(token, message, unix_timestamp())
-                            .await;
-                        publish(&app);
-                        windows::open_dashboard(&app);
-                    });
+                let accepted =
+                    notifications::deliver(&runtime, token, notifications::send(&app, &snapshot))
+                        .await;
+                publish(&app);
+                if !accepted {
+                    windows::open_dashboard(&app);
                 }
-            }
+            });
         }
         return;
     }
@@ -670,7 +637,6 @@ fn present(app: &tauri::AppHandle) {
                     token,
                     "Your reminder couldn't appear, so it is waiting in Activities. Try another alert style."
                         .into(),
-                    unix_timestamp(),
                 )
                 .await;
             publish(&app);
@@ -692,8 +658,9 @@ fn present(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod sound_tests {
-    use super::{update_appearance, valid_wav, write_custom_sound};
+    use super::update_appearance;
     use crate::domain::{Appearance, ColorTheme, Settings};
+    use crate::sounds::valid_wav;
 
     #[test]
     fn independent_appearance_updates_preserve_other_preferences() {
@@ -702,25 +669,6 @@ mod sound_tests {
         update_appearance(&mut settings, None, Some(ColorTheme::Cobalt));
         assert_eq!(settings.appearance, Appearance::Dark);
         assert_eq!(settings.color_theme, ColorTheme::Cobalt);
-    }
-
-    #[test]
-    fn persists_custom_wav_without_overwriting_existing_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("sounds/custom.wav");
-        let bytes = &include_bytes!("../../public/sounds/back.wav")[..];
-        write_custom_sound(&path, bytes).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(write_custom_sound(&path, bytes).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
     }
 
     #[test]

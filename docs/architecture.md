@@ -52,7 +52,7 @@ SQLite open runs `quick_check`. If integrity fails, Sela preserves the database 
 
 ## Scheduler and alert policy
 
-Deadlines are absolute Unix timestamps. The native scheduler sleeps until the next deadline, wakes immediately on reminder writes, and rechecks at least every 30 seconds for wall-clock changes. It catches overdue reminders after resume/relaunch; it cannot wake a sleeping or powered-off Mac. Full-screen and notch alerts show one reminder at a time; dismissing leaves it due in Activities. Native notifications hand off the alert while keeping the reminder due and rate-limit overdue backlog delivery. Failed display attempts are kept in Activities and do not block the rest of the queue.
+Deadlines are absolute Unix timestamps. The native scheduler sleeps until the next deadline, wakes immediately on reminder writes, and rechecks at least every 30 seconds for wall-clock changes. It catches overdue reminders after resume/relaunch; it cannot wake a sleeping or powered-off Mac. Full-screen and notch alerts show one reminder at a time; dismissing leaves it due in Activities without automatically presenting it again until the reminder changes or Sela restarts. Native notifications hand off the alert while keeping the reminder due and rate-limit overdue backlog delivery. Failed display attempts are kept in Activities and do not block the rest of the queue. The dashboard identifies occurrences whose delivery is suppressed for the current process.
 
 Actions carry both snapshot revision and alert token. Stale alert clicks are rejected. The dashboard groups timed, untimed, and previous records; only a bounded page is rendered at once.
 
@@ -63,7 +63,7 @@ Actions carry both snapshot revision and alert token. Stale alert clicks are rej
 - `features/quick-add`: compact keyboard entry; no dashboard form.
 - `features/activities`: time/status accordion and bounded history paging.
 - `features/settings`: system appearance, optional accent, alert style, login item, shortcuts.
-- `features/onboarding`: three optional-first-run slides; settings/permissions remain opt-in.
+- `features/onboarding`: two optional-first-run slides; settings/permissions remain opt-in.
 - `features/alert`: fullscreen, notch, and macOS notification interaction.
 - `features/about`: version, creator, data and platform limits.
 - `components/ui`: upstream shadcn/Base UI primitives; domain composition stays in feature folders.

@@ -26,6 +26,10 @@ No planner to maintain. Sela is for the reminder you don't need to hold in your 
 - **Pick the kind of nudge that fits the moment:** a full-screen pause, a compact notch alert, or a macOS notification.
 - **Change your mind without losing the reminder:** mark it done, snooze it, reschedule it, or leave it in Activities for later.
 - **Keep your reminders on your Mac.** Sela has no account or analytics. Apple Reminders sync is not available yet.
+- **No timer means no alert.** These reminders remain in Activities until you choose a time or complete them.
+- **Recover a reminder** from Previous. Reopening a completed recurring occurrence creates a separate reminder and leaves the series unchanged.
+
+Dismiss closes the current alert without automatically scheduling another alert for that occurrence. It remains in Activities; use snooze or reschedule when you want another reminder. Editing the reminder or restarting Sela can make it alert again. An overdue reopened reminder may alert immediately.
 
 ### A few shortcuts
 

@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event"
 import { useCurrentTime } from "@/app/clock"
 import type { NativeState } from "@/app/use-native-state"
 import { Button } from "@/components/ui/button"
+import { alertShortcut } from "@/features/alert/shortcuts"
 import { playAlertSound } from "@/features/alert/sound"
 
 function relativeCreatedAt(createdAt: number, now: number) {
@@ -99,16 +100,12 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
 
   React.useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey) return
-      const key = event.key.toLowerCase()
-      if (key === "escape") {
-        event.preventDefault()
+      const action = alertShortcut(event, preview)
+      if (!action) return
+      event.preventDefault()
+      if (action === "dismiss") {
         void dismiss()
-      } else if (!preview && key === "enter") {
-        event.preventDefault()
-        void change("done")
-      } else if (!preview && key === "s") {
-        event.preventDefault()
+      } else {
         void change("snooze", snoozeMinutes * 60_000)
       }
     }
@@ -127,7 +124,8 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
     return (
       <main className="h-svh overflow-hidden bg-transparent px-3">
         <section
-          className="max-h-44 animate-in overflow-y-auto rounded-b-2xl border border-t-0 bg-background p-5 shadow-lg duration-200 slide-in-from-top-full"
+          className="max-h-[min(11rem,100svh)] animate-in overflow-y-auto rounded-b-2xl border border-t-0 bg-background p-5 shadow-lg duration-200 slide-in-from-top-full"
+          data-alert-scroll
           key={entrance}
           role="alertdialog"
           aria-labelledby="alert-title"
@@ -149,14 +147,14 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
             ) : active ? (
               <>
                 <Button size="sm" onClick={() => void change("done")}>
-                  Done <kbd>↵</kbd>
+                  Done
                 </Button>
                 <Button
                   size="sm"
                   variant="outline"
                   onClick={() => void change("snooze", snoozeMinutes * 60_000)}
                 >
-                  {snoozeMinutes} more min <kbd>S</kbd>
+                  Snooze {snoozeMinutes} min <kbd aria-hidden="true">S</kbd>
                 </Button>
                 <Button
                   className="ml-auto"
@@ -164,11 +162,16 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
                   variant="ghost"
                   onClick={() => void dismiss()}
                 >
-                  Not now <kbd>Esc</kbd>
+                  Dismiss <kbd aria-hidden="true">Esc</kbd>
                 </Button>
               </>
             ) : null}
           </div>
+          {!preview && active ? (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Dismiss keeps this reminder in Activities without snoozing it.
+            </p>
+          ) : null}
           {error ? (
             <p className="mt-2 text-xs font-medium" role="alert">
               {error}
@@ -180,9 +183,12 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
   }
 
   return (
-    <main className="grid min-h-svh place-items-center bg-background p-10">
+    <main
+      className="flex h-svh flex-col overflow-y-auto bg-background p-6 sm:p-10"
+      data-alert-scroll
+    >
       <section
-        className="flex w-full max-w-4xl animate-in flex-col items-center text-center duration-300 fade-in slide-in-from-bottom-2"
+        className="my-auto flex w-full max-w-4xl shrink-0 animate-in flex-col items-center self-center text-center duration-300 fade-in slide-in-from-bottom-2"
         key={entrance}
         role="alertdialog"
         aria-labelledby="alert-title"
@@ -193,7 +199,7 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
             : `Hey — ${kicker.charAt(0).toLowerCase()}${kicker.slice(1)}`}
         </p>
         <h1
-          className="mt-5 max-w-4xl text-5xl leading-tight font-semibold tracking-tight break-words outline-none lg:text-7xl"
+          className="mt-5 max-w-full text-5xl leading-tight font-semibold tracking-tight break-words outline-none lg:text-7xl"
           id="alert-title"
           ref={heading}
           tabIndex={-1}
@@ -208,14 +214,14 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
           ) : active ? (
             <>
               <Button size="lg" onClick={() => void change("done")}>
-                Done <kbd>↵</kbd>
+                Done
               </Button>
               <Button
                 size="lg"
                 variant="outline"
                 onClick={() => void change("snooze", snoozeMinutes * 60_000)}
               >
-                {snoozeMinutes} more min <kbd>S</kbd>
+                Snooze {snoozeMinutes} min <kbd aria-hidden="true">S</kbd>
               </Button>
             </>
           ) : null}
@@ -226,8 +232,13 @@ export function ReminderAlert({ nativeState }: { nativeState: NativeState }) {
             variant="ghost"
             onClick={() => void dismiss()}
           >
-            Not now, keep it in Activities <kbd>Esc</kbd>
+            Dismiss — keep in Activities <kbd aria-hidden="true">Esc</kbd>
           </Button>
+        ) : null}
+        {!preview && active ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Dismiss keeps this reminder in Activities without snoozing it.
+          </p>
         ) : null}
         {error ? (
           <p className="mt-4 text-sm font-medium" role="alert">

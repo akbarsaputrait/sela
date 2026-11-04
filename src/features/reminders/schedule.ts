@@ -1,3 +1,5 @@
+export const MAX_SELECTED_DATES = 10_000
+
 export type ScheduleKind = "once" | "daily" | "weekdays" | "dates"
 
 // Dates and times are local wall-clock values, not UTC strings.
@@ -114,6 +116,13 @@ export function resolveSchedule(
   if (values.kind !== "dates" && !validDate(values.date))
     errors.push("Choose a valid date.")
   if (values.kind === "dates") {
+    if (values.dates.length > MAX_SELECTED_DATES)
+      return {
+        schedule: null,
+        errors: [
+          `Choose no more than ${MAX_SELECTED_DATES.toLocaleString("en-US")} dates.`,
+        ],
+      }
     if (!values.dates.length || values.dates.some((date) => !validDate(date)))
       errors.push("Choose valid dates for every entry.")
   }

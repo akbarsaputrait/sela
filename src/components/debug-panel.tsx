@@ -193,6 +193,24 @@ type LocationState = {
 type DebugPanelSide = "left" | "right" | "bottom"
 type DebugPanelTab = "overview" | "runtime" | "system" | "errors"
 
+export function attachNativeConsole(onError: (error: unknown) => void) {
+  let disposed = false
+  let detachConsole: (() => void) | undefined
+
+  void attachConsole()
+    .then((detach) => {
+      if (disposed) detach()
+      else detachConsole = detach
+    })
+    .catch(onError)
+
+  return () => {
+    disposed = true
+    detachConsole?.()
+    detachConsole = undefined
+  }
+}
+
 const MAX_LOG_ITEMS = 10
 const LOG_TIMESTAMP_FORMATTER = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit",
@@ -1349,16 +1367,14 @@ export function DebugPanel() {
       capture("debug", args, originalConsole.debug)
     }
 
-    let detachConsole: (() => void) | undefined
-
-    if (tauriReady) {
-      void attachConsole().then((detach) => {
-        detachConsole = detach
-      })
-    }
+    const detachNativeConsole = tauriReady
+      ? attachNativeConsole((failure) =>
+          originalConsole.warn("Native log attachment unavailable", failure)
+        )
+      : undefined
 
     return () => {
-      detachConsole?.()
+      detachNativeConsole?.()
       window.console.log = originalConsole.log
       window.console.info = originalConsole.info
       window.console.warn = originalConsole.warn

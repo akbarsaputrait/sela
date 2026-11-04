@@ -58,12 +58,12 @@ export const ALERT_STYLES: Array<{
   {
     value: "fullscreen",
     label: "Full screen",
-    help: "A clear pause with your reminder front and center.",
+    help: "A clear pause with your reminder front and center. This in-app alert does not follow macOS Focus.",
   },
   {
     value: "notch",
     label: "From the notch",
-    help: "A compact reminder at the top of the current display.",
+    help: "A compact reminder at the top of the current display. This in-app alert does not follow macOS Focus.",
   },
   {
     value: "native",
@@ -89,6 +89,9 @@ export function Settings({
 }) {
   const [savingLogin, setSavingLogin] = React.useState(false)
   const [uploadingSound, setUploadingSound] = React.useState(false)
+  const [notificationPermission, setNotificationPermission] = React.useState<
+    string | null
+  >(null)
   const soundFile = React.useRef<HTMLInputElement>(null)
   const loginRequest = React.useRef(false)
   const request = (name: string, args?: Record<string, unknown>) => {
@@ -107,6 +110,26 @@ export function Settings({
     window.addEventListener("focus", refresh)
     return () => window.removeEventListener("focus", refresh)
   }, [disabled, command, onError])
+
+  React.useEffect(() => {
+    if (disabled || settings.alertStyle !== "native") return
+    let active = true
+    const refreshPermission = () => {
+      void command<string>("get_notification_permission")
+        .then((status) => {
+          if (active) setNotificationPermission(status)
+        })
+        .catch(() => {
+          if (active) setNotificationPermission("unknown")
+        })
+    }
+    refreshPermission()
+    window.addEventListener("focus", refreshPermission)
+    return () => {
+      active = false
+      window.removeEventListener("focus", refreshPermission)
+    }
+  }, [disabled, settings.alertStyle, command])
 
   const toggleLogin = async (enabled: boolean) => {
     if (loginRequest.current) return
@@ -268,6 +291,21 @@ export function Settings({
             ))}
           </RadioGroup>
         </div>
+        {settings.alertStyle === "native" && (
+          <p className="pb-3 text-xs text-muted-foreground" role="status">
+            {notificationPermission === "authorized"
+              ? "macOS notification permission is allowed. Focus and system notification settings still apply."
+              : notificationPermission === "denied"
+                ? "Notifications are not allowed. Open System Settings → Notifications → Sela to allow them."
+                : notificationPermission === "notDetermined"
+                  ? "macOS will ask for notification permission when you test or receive an alert."
+                  : notificationPermission === "unavailable"
+                    ? "macOS notifications are unavailable on this system."
+                    : notificationPermission === "unknown"
+                      ? "Couldn't check notification permission. Check System Settings → Notifications → Sela."
+                      : "Checking notification permission…"}
+          </p>
+        )}
         <SettingRow
           id="alert-sound"
           label="Alert sound"
@@ -439,7 +477,16 @@ export function Settings({
             size="sm"
             variant="outline"
             className="rounded-md text-xs"
-            onClick={() => request("preview_alert")}
+            onClick={() => {
+              if (settings.alertStyle !== "native" && settings.soundEnabled) {
+                void playAlertSound(
+                  settings.soundChoice,
+                  settings.customSoundId,
+                  command
+                ).catch((error: Error) => onError(error.message))
+              }
+              request("preview_alert")
+            }}
           >
             Test alert
           </Button>
@@ -477,7 +524,7 @@ export function Settings({
             ["Timer presets · quick add", "⌘1–3"],
             ["Custom duration · quick add", "⌘T"],
             ["Open dashboard · quick add", "⌘L"],
-            ["Complete · alert", "Enter"],
+            ["Complete · focused Done button", "Enter"],
             [`Snooze ${settings.defaultSnoozeMinutes} min · alert`, "S"],
             ["Dismiss · alert", "Esc"],
           ].map(([label, key]) => (

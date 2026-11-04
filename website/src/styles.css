@@ -98,7 +98,7 @@ body {
 }
 
 .appearance-toggle:focus-visible,
-«.primary-link:focus-visible,
+.primary-link:focus-visible,
 .playground-tab:focus-visible {
   outline-color: var(--site-foreground);
 }

@@ -4,6 +4,6 @@
   "assets": {
     "directory": "./dist-website",
     "base_path": "/",
-    "not_found_handling": "single-page-application",
+    "not_found_handling": "404-page",
   },
 }

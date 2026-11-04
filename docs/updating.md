@@ -19,7 +19,7 @@ Sela is currently an unsigned-development distribution. You do **not** need an A
 From the project directory:
 
 ```bash
-cd ~/personal/personal/sela
+cd /path/to/sela
 bun install --frozen-lockfile
 bun run check
 cargo test --manifest-path src-tauri/Cargo.toml
@@ -29,7 +29,7 @@ APPLE_SIGNING_IDENTITY=- bun run tauri build --bundles app
 If all commands succeed, the app is written to:
 
 ```text
-~/personal/personal/sela/src-tauri/target/release/bundle/macos/Sela.app
+src-tauri/target/release/bundle/macos/Sela.app
 ```
 
 The build does not update `/Applications` automatically. Open the build folder in Finder and drag `Sela.app` into Applications; choose Replace only after confirming you have the data backup and intend to replace the installed copy. Then launch Sela from Applications.
