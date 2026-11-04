@@ -3,6 +3,7 @@ mod domain;
 mod notifications;
 mod runtime;
 mod scheduling;
+mod sounds;
 mod storage;
 mod windows;
 
@@ -73,7 +74,6 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--background"]),
@@ -125,6 +125,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::mark_window_ready,
             commands::get_snapshot,
+            commands::get_notification_permission,
+            commands::take_requested_dashboard_tab,
+            commands::resize_capture,
+            commands::clear_resolved_history,
+            commands::reopen_reminder,
+            commands::edit_timer_reminder,
             commands::create_reminder,
             commands::create_scheduled_reminder,
             commands::edit_scheduled_reminder,
@@ -192,7 +198,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     windows::create_auxiliary_windows(app)?;
     windows::apply_appearance(app.handle(), appearance);
-    notifications::configure(app);
     configure_shortcut(app, &runtime);
     configure_tray(app)?;
 
@@ -278,6 +283,8 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "capture" => windows::open_capture(app),
             "activities" | "settings" | "about" => {
+                app.state::<Arc<AppRuntime>>()
+                    .request_dashboard_tab(event.id.as_ref());
                 windows::open_dashboard(app);
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.emit("sela://dashboard-tab", event.id.as_ref());

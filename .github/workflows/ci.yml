@@ -14,20 +14,30 @@ jobs:
     name: macOS quality checks
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri -> target
       - run: bun install --frozen-lockfile
       - run: bun run check
+      - run: bun run test:distribution
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Compile native desktop app
         run: bun run tauri build --debug --no-bundle
+      - name: Run isolated native GUI smoke (synthetic notification handoff only)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          # Tauri/WebKit needs the hosted Mac's logged-in Aqua session.
+          # Fail explicitly rather than silently skip if GUI support disappears.
+          launchctl print "gui/$(id -u)" >/dev/null
+          src-tauri/target/debug/sela --smoke-test

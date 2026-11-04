@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react"
-import { Moon, Sun } from "lucide-react"
 
 import { Kbd } from "@/components/ui/kbd"
 import { DesktopScene } from "./desktop-scene"
@@ -36,26 +35,24 @@ function getSavedAppearance(): Appearance {
   }
 }
 
-function AppearanceToggle({
+function AppearanceSelect({
   appearance,
   onChange,
 }: {
-  appearance: EffectiveAppearance
-  onChange: () => void
+  appearance: Appearance
+  onChange: (appearance: Appearance) => void
 }) {
-  const Icon = appearance === "dark" ? Moon : Sun
-  const nextAppearance = appearance === "dark" ? "light" : "dark"
-
   return (
-    <button
-      aria-label={`Switch to ${nextAppearance} appearance`}
-      className="appearance-toggle grid size-10 place-items-center rounded-lg transition-colors focus-visible:outline-2 focus-visible:outline-offset-4"
-      onClick={onChange}
-      title={`Switch to ${nextAppearance} appearance`}
-      type="button"
+    <select
+      aria-label="Appearance"
+      className="appearance-toggle h-10 rounded-lg px-2 text-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-4"
+      onChange={(event) => onChange(event.target.value as Appearance)}
+      value={appearance}
     >
-      <Icon aria-hidden="true" className="size-4" />
-    </button>
+      <option value="system">System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
   )
 }
 
@@ -153,6 +150,7 @@ export function LandingPage() {
   const [reducedMotion, setReducedMotion] = useState(false)
   const [systemAppearance, setSystemAppearance] = useState<EffectiveAppearance>(
     () =>
+      typeof window !== "undefined" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches
         ? "dark"
         : "light"
@@ -165,6 +163,7 @@ export function LandingPage() {
     const updateSystemAppearance = () =>
       setSystemAppearance(media.matches ? "dark" : "light")
 
+    updateSystemAppearance()
     media.addEventListener("change", updateSystemAppearance)
     return () => media.removeEventListener("change", updateSystemAppearance)
   }, [])
@@ -203,10 +202,6 @@ export function LandingPage() {
       )
   }, [appearance, effectiveAppearance])
 
-  const toggleAppearance = () => {
-    setAppearance(effectiveAppearance === "dark" ? "light" : "dark")
-  }
-
   return (
     <main className="site-shell relative isolate flex min-h-svh flex-col overflow-x-hidden px-5 sm:px-8">
       <DotWave />
@@ -232,10 +227,7 @@ export function LandingPage() {
             A little space to remember
           </span>
         </div>
-        <AppearanceToggle
-          appearance={effectiveAppearance}
-          onChange={toggleAppearance}
-        />
+        <AppearanceSelect appearance={appearance} onChange={setAppearance} />
       </header>
 
       <section

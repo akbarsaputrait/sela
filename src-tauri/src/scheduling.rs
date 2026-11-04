@@ -221,6 +221,52 @@ mod tests {
         }
     }
     #[test]
+    fn shared_semantic_fixtures_match_expected_instants() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            name: String,
+            schedule: Schedule,
+            after: String,
+            expected: Option<String>,
+        }
+        let fixtures: Vec<Fixture> = serde_json::from_str(include_str!(
+            "../../src/features/reminders/schedule-fixtures.json"
+        ))
+        .unwrap();
+        for fixture in fixtures {
+            let after = ms(&fixture.after);
+            match fixture.expected {
+                Some(expected) => {
+                    let schedule = fixture
+                        .schedule
+                        .normalize_and_validate(after)
+                        .unwrap_or_else(|error| panic!("{}: {error}", fixture.name));
+                    assert_eq!(
+                        schedule.next_after(after).unwrap(),
+                        Some(ms(&expected)),
+                        "{}",
+                        fixture.name
+                    );
+                    // Persist/reload retains the same zone and strictly-future semantics.
+                    let reloaded: Schedule =
+                        serde_json::from_str(&serde_json::to_string(&schedule).unwrap()).unwrap();
+                    assert_eq!(
+                        reloaded.next_after(after).unwrap(),
+                        Some(ms(&expected)),
+                        "{}",
+                        fixture.name
+                    );
+                }
+                None => assert!(
+                    fixture.schedule.normalize_and_validate(after).is_err(),
+                    "{}",
+                    fixture.name
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn once_strict_boundary_and_past() {
         let s = schedule(ScheduleKind::Once, "2025-01-01", "09:00", "Asia/Tokyo");
         let when = ms("2025-01-01T00:00:00Z");

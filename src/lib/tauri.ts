@@ -8,6 +8,7 @@ import {
 } from "./debug-events"
 
 export async function trackedInvoke<T>(command: string, args?: InvokeArgs) {
+  if (!import.meta.env.DEV) return invoke<T>(command, args)
   const startedAt = performance.now()
 
   try {
@@ -43,6 +44,7 @@ export async function trackedInvoke<T>(command: string, args?: InvokeArgs) {
 
 export async function trackedEmit<T>(event: string, payload?: T) {
   await emit(event, payload)
+  if (!import.meta.env.DEV) return
 
   emitDebugEvent({
     id: crypto.randomUUID(),

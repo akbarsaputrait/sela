@@ -1,0 +1,77 @@
+name: Deploy website from latest stable release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let an older run finish after a newer deployment. Every queued run also
+# rechecks /releases/latest immediately before publishing.
+concurrency:
+  group: website-production
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: ${{ github.event_name != 'release' || (!github.event.release.prerelease && !github.event.release.draft) }}
+    runs-on: ubuntu-latest
+    outputs:
+      eligible: ${{ steps.release.outputs.eligible }}
+      id: ${{ steps.release.outputs.id }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Resolve exact latest published stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_RELEASE_ID: ${{ github.event.release.id }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api repos/akbarsaputrait/sela/releases/latest)
+          id=$(jq -er '.id | select(type == "number" and . > 0)' <<< "$latest")
+          tag=$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$latest")
+          jq -e '.draft == false and .prerelease == false' <<< "$latest" >/dev/null
+          if [[ -n "$EVENT_RELEASE_ID" && "$EVENT_RELEASE_ID" != "$id" ]]; then
+            echo "Ignoring a published release that is not the latest stable release."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.eligible == 'true' }}
+    runs-on: ubuntu-latest
+    environment: website
+    steps:
+      - name: Require scoped Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required website environment secret/configuration: $name" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - name: Build, verify exact release asset, deploy and verify served bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELA_RELEASE_ID: ${{ needs.resolve.outputs.id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: bun run deploy:website

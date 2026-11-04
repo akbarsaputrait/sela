@@ -56,7 +56,10 @@ export function Onboarding({
   return (
     <main className="mx-auto flex min-h-svh w-full max-w-3xl flex-col px-8 py-7">
       <header className="mb-5 flex items-center justify-between">
-        <p className="text-2xl font-semibold tracking-tight">Sela</p>
+        <div className="flex items-center gap-2">
+          <img src="/favicon.png" alt="" width="36" height="36" />
+          <p className="text-2xl font-semibold tracking-tight">Sela</p>
+        </div>
         <div
           aria-label={`Step ${slide + 1} of ${SLIDES.length}`}
           className="flex items-center gap-2"
@@ -182,11 +185,24 @@ export function Onboarding({
                 Preview selected alert
               </Button>
               <p className="mt-3 text-xs leading-5 text-muted-foreground">
-                In-app alerts need Sela running. macOS notifications follow
-                Focus and permissions.
+                Sela must be running and cannot wake a sleeping Mac. macOS
+                notifications follow Focus and permissions; in-app alerts do
+                not. You can enable Launch at login in Settings.
               </p>
             </div>
           )}
+          {snapshot.shortcutError ? (
+            <AppError
+              title="Quick Add shortcut unavailable"
+              message={snapshot.shortcutError}
+            />
+          ) : null}
+          {snapshot.deliveryError ? (
+            <AppError
+              title="Alert couldn't be delivered"
+              message={snapshot.deliveryError}
+            />
+          ) : null}
           {error ? <AppError message={error} /> : null}
         </div>
       </section>
@@ -224,7 +240,7 @@ function QuickAddPreview() {
           <p className="text-[10px] font-medium tracking-wide text-background/65 uppercase">
             Quick Add
           </p>
-          <p className="mt-1 truncate text-sm">Call Alex tomorrow</p>
+          <p className="mt-1 truncate text-sm">Call Alex</p>
         </div>
         <div className="flex gap-1">
           {PRESETS.map((preset, index) => (

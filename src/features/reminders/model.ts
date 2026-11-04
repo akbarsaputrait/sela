@@ -38,6 +38,19 @@ export function parseDuration(value: string): number | null {
   return milliseconds
 }
 
+export type PreviousEntry =
+  | (Reminder & { kind: "reminder"; timestamp: number })
+  | {
+      kind: "occurrence"
+      id: string
+      reminderId: string
+      occurrenceIndex: number
+      occurrenceRevision: number
+      title: string
+      createdAt: number
+      timestamp: number
+    }
+
 export function groupReminders(reminders: Reminder[]) {
   const pending = reminders.filter((reminder) => reminder.status === "pending")
   return {
@@ -57,11 +70,30 @@ export function groupReminders(reminders: Reminder[]) {
           right.createdAt - left.createdAt || left.id.localeCompare(right.id)
       ),
     previous: reminders
-      .filter((reminder) => reminder.status !== "pending")
+      .flatMap((reminder): PreviousEntry[] => [
+        ...(reminder.status !== "pending"
+          ? [
+              {
+                ...reminder,
+                kind: "reminder" as const,
+                timestamp: reminder.resolvedAt ?? reminder.createdAt,
+              },
+            ]
+          : []),
+        ...(reminder.occurrenceHistory ?? []).map((timestamp, index) => ({
+          kind: "occurrence" as const,
+          id: `${reminder.id}:occurrence:${timestamp}:${index}`,
+          reminderId: reminder.id,
+          occurrenceIndex: index,
+          occurrenceRevision: reminder.occurrenceRevision ?? 0,
+          title: reminder.title,
+          createdAt: reminder.createdAt,
+          timestamp,
+        })),
+      ])
       .toSorted(
         (left, right) =>
-          (right.resolvedAt ?? right.createdAt) -
-            (left.resolvedAt ?? left.createdAt) ||
+          right.timestamp - left.timestamp ||
           right.createdAt - left.createdAt ||
           left.id.localeCompare(right.id)
       ),
@@ -70,11 +102,13 @@ export function groupReminders(reminders: Reminder[]) {
 
 export function remainingLabel(dueAt: number | null, now: number) {
   if (dueAt === null) return "No timer"
-  const seconds = Math.ceil((dueAt - now) / 1_000)
-  if (seconds <= 0) return "Due now"
-  if (seconds < 60) return `In ${seconds}s`
+  const delta = dueAt - now
+  if (delta === 0) return "Due now"
+  const seconds = Math.ceil(Math.abs(delta) / 1_000)
+  const prefix = delta < 0 ? "Overdue by" : "In"
+  if (seconds < 60) return `${prefix} ${seconds}s`
   const minutes = Math.ceil(seconds / 60)
-  if (minutes < 60) return `In ${minutes}m`
+  if (minutes < 60) return `${prefix} ${minutes}m`
   const hours = Math.floor(minutes / 60)
-  return `In ${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`
+  return `${prefix} ${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`
 }

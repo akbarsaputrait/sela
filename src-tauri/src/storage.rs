@@ -2,6 +2,7 @@ use crate::domain::{
     AlertStyle, Appearance, ColorTheme, Document, MigrationMetadata, Reminder, ReminderStatus,
     SCHEMA_VERSION,
 };
+use crate::sounds;
 use rusqlite::{
     Connection, MAIN_DB, OptionalExtension, Transaction, TransactionBehavior, backup::Progress,
     params,
@@ -35,6 +36,8 @@ pub enum StorageError {
         "The database upgrade failed. A recovery copy is available at {recovery_path}. Quit Sela and preserve both files before retrying."
     )]
     UpgradeFailed { recovery_path: String },
+    #[error("{0}")]
+    SoundFailed(String),
 }
 
 pub struct AppStorage {
@@ -42,6 +45,9 @@ pub struct AppStorage {
     backup_path: PathBuf,
     connection: Mutex<Option<Connection>>,
     initialization_error: Option<StorageError>,
+    // Lock ordering is always sound_access, then connection. Upload leases span write,
+    // commit, and cleanup; reads hold the same lease until all bytes are loaded.
+    sound_access: Mutex<()>,
 }
 
 impl AppStorage {
@@ -58,6 +64,7 @@ impl AppStorage {
             backup_path,
             connection: Mutex::new(connection),
             initialization_error,
+            sound_access: Mutex::new(()),
         }
     }
 
@@ -185,6 +192,7 @@ impl AppStorage {
         legacy_paths: &[PathBuf],
         now: u64,
     ) -> Result<Document, StorageError> {
+        let _sounds = self.lock_sounds();
         let mut guard = self.lock_connection()?;
         let connection = guard.as_mut().ok_or(StorageError::WriteFailed)?;
         ensure_default_settings(connection)?;
@@ -206,10 +214,12 @@ impl AppStorage {
             }
         }
 
-        load_document(connection).map_err(|error| {
+        let document = load_document(connection).map_err(|error| {
             log::error!("could not load local reminders: {error}");
             preserve_database(&self.path)
-        })
+        })?;
+        self.reconcile_sounds(connection);
+        Ok(document)
     }
 
     fn import_legacy(
@@ -249,20 +259,127 @@ impl AppStorage {
     /// Apply only changed rows in one transaction. SQLite owns atomicity and indexed queries;
     /// no JSON document is rewritten for every reminder action.
     pub fn save_transition(&self, before: &Document, after: &Document) -> Result<(), StorageError> {
+        let _sounds = self.lock_sounds();
         let mut guard = self.lock_connection()?;
         let connection = guard.as_mut().ok_or(StorageError::WriteFailed)?;
-        self.backup_if_due(connection);
+        let backup_rotated = self.save_transition_locked(connection, before, after)?;
+        if backup_rotated || before.settings.custom_sound_id != after.settings.custom_sound_id {
+            self.reconcile_sounds(connection);
+        }
+        Ok(())
+    }
+
+    pub fn save_sound_transition(
+        &self,
+        before: &Document,
+        after: &Document,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let _sounds = self.lock_sounds();
+        let mut guard = self.lock_connection()?;
+        let connection = guard.as_mut().ok_or(StorageError::WriteFailed)?;
+        let id =
+            after.settings.custom_sound_id.as_deref().ok_or_else(|| {
+                StorageError::SoundFailed("The sound could not be selected.".into())
+            })?;
+        if before.settings.custom_sound_id.as_deref() == Some(id) {
+            return Err(StorageError::SoundFailed(
+                "Upload a new sound before replacing it.".into(),
+            ));
+        }
+        if let Err(error) = sounds::write(&self.sound_root(), id, bytes) {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                return Err(StorageError::SoundFailed(error.to_string()));
+            }
+            log::error!("could not save custom sound: {error}");
+            self.reconcile_sounds(connection);
+            return Err(StorageError::SoundFailed(
+                "The sound couldn't be saved. Check available disk space and try again.".into(),
+            ));
+        }
+        let result = self.save_transition_locked(connection, before, after);
+        // On rollback this reclaims the rejected upload; on commit it preserves the
+        // newly selected sound and every snapshot's former selection.
+        self.reconcile_sounds(connection);
+        result.map(|_| ())
+    }
+
+    pub fn read_custom_sound(&self, id: &str) -> Result<Vec<u8>, String> {
+        let _sounds = self.lock_sounds();
+        sounds::read(&self.sound_root(), id).map_err(|error| {
+            log::error!("could not read custom sound: {error}");
+            "That sound is unavailable. Upload it again.".into()
+        })
+    }
+
+    fn lock_sounds(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.sound_access
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn sound_root(&self) -> PathBuf {
+        self.path.with_file_name("sounds")
+    }
+
+    fn reconcile_sounds(&self, connection: &Connection) {
+        // A failed scan must never mean \"no references\". Keep all files until a
+        // later successful commit/startup can prove they are unreferenced.
+        let result = self.retained_sound_ids(connection).and_then(|retained| {
+            sounds::reconcile(&self.sound_root(), &retained).map_err(write_error)
+        });
+        if let Err(error) = result {
+            // This is post-commit maintenance: do not report a committed document
+            // as rolled back. Log the failure and retry at the next safe point.
+            log::warn!("custom sound reconciliation deferred: {error}");
+        }
+    }
+
+    fn retained_sound_ids(&self, connection: &Connection) -> Result<HashSet<String>, StorageError> {
+        let mut retained = HashSet::new();
+        collect_sound_reference(connection, &mut retained)?;
+        let parent = self.path.parent().ok_or(StorageError::WriteFailed)?;
+        for entry in fs::read_dir(parent).map_err(write_error)? {
+            let entry = entry.map_err(write_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !sound_backup_name(name) {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(write_error)?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                return Err(StorageError::WriteFailed);
+            }
+            let backup = Connection::open_with_flags(
+                entry.path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(write_error)?;
+            collect_sound_reference(&backup, &mut retained)?;
+        }
+        Ok(retained)
+    }
+
+    fn save_transition_locked(
+        &self,
+        connection: &mut Connection,
+        before: &Document,
+        after: &Document,
+    ) -> Result<bool, StorageError> {
+        let before_backup = self.backup_if_due(connection);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(write_error)?;
         write_document(&transaction, before, after)?;
         transaction.commit().map_err(write_error)?;
         // The first saved reminder has no old data to back up; create its initial snapshot after commit.
-        self.backup_if_due(connection);
-        Ok(())
+        let after_backup = self.backup_if_due(connection);
+        Ok(before_backup || after_backup)
     }
 
-    fn backup_if_due(&self, connection: &Connection) {
+    fn backup_if_due(&self, connection: &Connection) -> bool {
         let day = unix_timestamp() / 86_400_000;
         if metadata(connection, "last_backup_day")
             .ok()
@@ -270,7 +387,7 @@ impl AppStorage {
             .as_deref()
             == Some(&day.to_string())
         {
-            return;
+            return false;
         }
         let has_data = connection
             .query_row(
@@ -280,7 +397,7 @@ impl AppStorage {
             )
             .unwrap_or(false);
         if !has_data {
-            return;
+            return false;
         }
         let temporary = self.backup_path.with_extension("sqlite3.tmp");
         let _ = fs::remove_file(&temporary);
@@ -289,14 +406,18 @@ impl AppStorage {
                 if let Err(error) = fs::rename(&temporary, &self.backup_path) {
                     log::warn!("could not rotate SQLite backup: {error}");
                     let _ = fs::remove_file(&temporary);
-                    return;
+                    return false;
                 }
                 let _ = connection.execute(
                     "INSERT INTO metadata(key, value) VALUES ('last_backup_day', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![day.to_string()],
                 );
+                true
             }
-            Err(error) => log::warn!("could not create daily SQLite backup: {error}"),
+            Err(error) => {
+                log::warn!("could not create daily SQLite backup: {error}");
+                false
+            }
         }
     }
 
@@ -315,6 +436,65 @@ impl AppStorage {
         }
         Ok(guard)
     }
+}
+
+fn sound_backup_name(name: &str) -> bool {
+    if matches!(name, "sela.backup.sqlite3" | "sela.backup.sqlite3.tmp") {
+        return true;
+    }
+    let Some(stem) = name.strip_suffix(".sqlite3") else {
+        return false;
+    };
+    let suffix = stem
+        .strip_prefix("sela.pre-upgrade-v")
+        .or_else(|| stem.strip_prefix("sela.corrupt-"));
+    let Some((version_or_time, id)) = suffix.and_then(|value| value.split_once('-')) else {
+        return false;
+    };
+    !version_or_time.is_empty()
+        && version_or_time.bytes().all(|byte| byte.is_ascii_digit())
+        && uuid::Uuid::parse_str(id).is_ok()
+}
+
+fn collect_sound_reference(
+    connection: &Connection,
+    retained: &mut HashSet<String>,
+) -> Result<(), StorageError> {
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(write_error)?;
+    if version > DB_SCHEMA_VERSION {
+        return Err(StorageError::NewerVersion);
+    }
+    let mut statement = connection
+        .prepare("PRAGMA table_info(settings)")
+        .map_err(write_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(write_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(write_error)?;
+    if !columns.iter().any(|column| column == "custom_sound_id") {
+        return if version < 4 {
+            Ok(())
+        } else {
+            Err(StorageError::WriteFailed)
+        };
+    }
+    let id: Option<String> = connection
+        .query_row(
+            "SELECT custom_sound_id FROM settings WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(write_error)?
+        .flatten();
+    if let Some(id) = id {
+        let id = uuid::Uuid::parse_str(&id).map_err(write_error)?;
+        retained.insert(id.to_string());
+    }
+    Ok(())
 }
 
 fn migrate_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
@@ -667,6 +847,282 @@ pub fn unix_timestamp() -> u64 {
 mod tests {
     use super::*;
 
+    const SOUND_WAV: &[u8] = include_bytes!("../../public/sounds/back.wav");
+
+    fn selecting_sound(document: &Document) -> Document {
+        let mut next = document.clone();
+        next.settings.custom_sound_id = Some(uuid::Uuid::new_v4().to_string());
+        next.settings.sound_choice = crate::domain::SoundChoice::Custom;
+        next
+    }
+
+    #[test]
+    fn replacement_reclaims_unreferenced_wavs_and_startup_crash_leftovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sela.sqlite3");
+        let storage = AppStorage::new(path.clone());
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        let first = selecting_sound(&empty);
+        storage
+            .save_sound_transition(&empty, &first, SOUND_WAV)
+            .unwrap();
+        let second = selecting_sound(&first);
+        storage
+            .save_sound_transition(&first, &second, SOUND_WAV)
+            .unwrap();
+        assert!(
+            !sounds::sound_path(
+                &storage.sound_root(),
+                first.settings.custom_sound_id.as_deref().unwrap()
+            )
+            .unwrap()
+            .exists()
+        );
+        assert_eq!(
+            storage
+                .read_custom_sound(second.settings.custom_sound_id.as_deref().unwrap())
+                .unwrap(),
+            SOUND_WAV
+        );
+        let orphan = uuid::Uuid::new_v4().to_string();
+        sounds::write(&storage.sound_root(), &orphan, SOUND_WAV).unwrap();
+        drop(storage);
+        let reopened = AppStorage::new(path);
+        let loaded = reopened.load_or_migrate(&[], 200).unwrap();
+        assert_eq!(
+            loaded.settings.custom_sound_id,
+            second.settings.custom_sound_id
+        );
+        assert!(
+            !sounds::sound_path(&reopened.sound_root(), &orphan)
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(
+            reopened
+                .read_custom_sound(loaded.settings.custom_sound_id.as_deref().unwrap())
+                .unwrap(),
+            SOUND_WAV
+        );
+    }
+
+    #[test]
+    fn failed_sound_persistence_preserves_prior_selection_and_reclaims_rejected_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = AppStorage::new(directory.path().join("sela.sqlite3"));
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        let first = selecting_sound(&empty);
+        storage
+            .save_sound_transition(&empty, &first, SOUND_WAV)
+            .unwrap();
+        storage.connection.lock().unwrap().as_ref().unwrap().execute_batch(
+            "CREATE TRIGGER reject_sound BEFORE UPDATE ON settings BEGIN SELECT RAISE(ABORT, 'simulated sound persistence failure'); END;"
+        ).unwrap();
+        let rejected = selecting_sound(&first);
+        assert!(
+            storage
+                .save_sound_transition(&first, &rejected, SOUND_WAV)
+                .is_err()
+        );
+        assert!(
+            !sounds::sound_path(
+                &storage.sound_root(),
+                rejected.settings.custom_sound_id.as_deref().unwrap()
+            )
+            .unwrap()
+            .exists()
+        );
+        let loaded = storage.load_or_migrate(&[], 200).unwrap();
+        assert_eq!(
+            loaded.settings.custom_sound_id,
+            first.settings.custom_sound_id
+        );
+        assert_eq!(
+            storage
+                .read_custom_sound(first.settings.custom_sound_id.as_deref().unwrap())
+                .unwrap(),
+            SOUND_WAV
+        );
+    }
+
+    #[test]
+    fn sound_write_failure_never_changes_the_database_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = AppStorage::new(directory.path().join("sela.sqlite3"));
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        fs::write(storage.sound_root(), b"not a sound directory").unwrap();
+        assert!(
+            storage
+                .save_sound_transition(&empty, &selecting_sound(&empty), SOUND_WAV)
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .load_or_migrate(&[], 200)
+                .unwrap()
+                .settings
+                .custom_sound_id,
+            None
+        );
+        assert_eq!(
+            fs::read(storage.sound_root()).unwrap(),
+            b"not a sound directory"
+        );
+    }
+
+    #[test]
+    fn daily_and_preupgrade_backups_keep_their_selected_sound() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = AppStorage::new(directory.path().join("sela.sqlite3"));
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        let mut first = selecting_sound(&empty);
+        first.create("ensure daily backups", None, 100).unwrap();
+        storage
+            .save_sound_transition(&empty, &first, SOUND_WAV)
+            .unwrap();
+        {
+            let guard = storage.connection.lock().unwrap();
+            let connection = guard.as_ref().unwrap();
+            set_metadata(connection, "last_backup_day", "force-next-rotation").unwrap();
+            create_private_backup(
+                connection,
+                &directory.path().join(format!(
+                    "sela.pre-upgrade-v4-{}.sqlite3",
+                    uuid::Uuid::new_v4()
+                )),
+            )
+            .unwrap();
+        }
+        let second = selecting_sound(&first);
+        storage
+            .save_sound_transition(&first, &second, SOUND_WAV)
+            .unwrap();
+        let backup = Connection::open_with_flags(
+            &storage.backup_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let backup_id: String = backup
+            .query_row(
+                "SELECT custom_sound_id FROM settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(backup_id.as_str()),
+            first.settings.custom_sound_id.as_deref()
+        );
+        let third = selecting_sound(&second);
+        storage
+            .save_sound_transition(&second, &third, SOUND_WAV)
+            .unwrap();
+        assert_eq!(storage.read_custom_sound(&backup_id).unwrap(), SOUND_WAV);
+        assert!(
+            !sounds::sound_path(
+                &storage.sound_root(),
+                second.settings.custom_sound_id.as_deref().unwrap()
+            )
+            .unwrap()
+            .exists()
+        );
+        // A daily rotation must not discard a separately preserved migration snapshot.
+        {
+            let guard = storage.connection.lock().unwrap();
+            set_metadata(guard.as_ref().unwrap(), "last_backup_day", "rotate-again").unwrap();
+        }
+        storage.save_transition(&third, &third).unwrap();
+        assert_eq!(storage.read_custom_sound(&backup_id).unwrap(), SOUND_WAV);
+    }
+
+    #[test]
+    fn unreadable_backup_defers_cleanup_instead_of_losing_restore_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = AppStorage::new(directory.path().join("sela.sqlite3"));
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        let first = selecting_sound(&empty);
+        storage
+            .save_sound_transition(&empty, &first, SOUND_WAV)
+            .unwrap();
+        fs::write(&storage.backup_path, b"unreadable recovery database").unwrap();
+        let second = selecting_sound(&first);
+        storage
+            .save_sound_transition(&first, &second, SOUND_WAV)
+            .unwrap();
+        assert_eq!(
+            storage
+                .read_custom_sound(first.settings.custom_sound_id.as_deref().unwrap())
+                .unwrap(),
+            SOUND_WAV
+        );
+        assert_eq!(
+            storage
+                .read_custom_sound(second.settings.custom_sound_id.as_deref().unwrap())
+                .unwrap(),
+            SOUND_WAV
+        );
+    }
+
+    #[test]
+    fn serialized_sound_lease_protects_pending_uploads_and_reads_from_cleanup() {
+        use std::sync::{Arc, mpsc};
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(AppStorage::new(directory.path().join("sela.sqlite3")));
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        let next = selecting_sound(&empty);
+        let id = next.settings.custom_sound_id.clone().unwrap();
+        // Pause a real upload after writing but before committing. Both ordinary
+        // commit cleanup and browser byte reads must wait for the entire lease.
+        let lease = storage.lock_sounds();
+        sounds::write(&storage.sound_root(), &id, SOUND_WAV).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = {
+            let storage = Arc::clone(&storage);
+            let id = id.clone();
+            let started = started_tx.clone();
+            let results = result_tx.clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                results.send(storage.read_custom_sound(&id)).unwrap();
+            })
+        };
+        let committer = {
+            let storage = Arc::clone(&storage);
+            let next = next.clone();
+            let before = empty.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = storage
+                    .save_transition(&before, &next)
+                    .map(|()| Vec::new())
+                    .map_err(|error| error.to_string());
+                result_tx.send(result).unwrap();
+            })
+        };
+        started_rx.recv().unwrap();
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        {
+            let mut connection = storage.lock_connection().unwrap();
+            storage
+                .save_transition_locked(connection.as_mut().unwrap(), &empty, &next)
+                .unwrap();
+        }
+        drop(lease);
+        let results = [
+            result_rx.recv().unwrap().unwrap(),
+            result_rx.recv().unwrap().unwrap(),
+        ];
+        assert!(results.iter().any(|bytes| bytes.as_slice() == SOUND_WAV));
+        reader.join().unwrap();
+        committer.join().unwrap();
+        assert_eq!(storage.read_custom_sound(&id).unwrap(), SOUND_WAV);
+    }
+
     #[test]
     fn scheduling_fields_round_trip_and_v2_upgrade_keeps_backup() {
         let directory = tempfile::tempdir().unwrap();
@@ -872,6 +1328,30 @@ mod tests {
         assert_eq!(reopened.reminders[0].id, id);
         assert!(path.exists());
         assert!(directory.path().join("sela.backup.sqlite3").exists());
+    }
+
+    #[test]
+    fn reopened_occurrence_and_consumed_history_survive_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = AppStorage::new(directory.path().join("sela.sqlite3"));
+        let empty = storage.load_or_migrate(&[], 100).unwrap();
+        let schedule: crate::scheduling::Schedule = serde_json::from_str(r#"{"kind":"daily","date":"2025-01-01","time":"09:00","weekdays":[],"dates":[],"endDate":null,"timeZone":"UTC"}"#).unwrap();
+        let now = 1_735_689_600_000;
+        let mut completed = empty.clone();
+        let id = completed.create_scheduled("daily", schedule, now).unwrap();
+        let due = completed.reminders[0].due_at.unwrap();
+        completed
+            .resolve(&id, crate::domain::ReminderStatus::Completed, due)
+            .unwrap();
+        storage.save_transition(&empty, &completed).unwrap();
+        let mut reopened = completed.clone();
+        let revision = reopened.reminders[0].occurrence_revision;
+        reopened
+            .reopen(&id, revision, Some((0, due)), due + 1)
+            .unwrap();
+        storage.save_transition(&completed, &reopened).unwrap();
+        let loaded = storage.load_or_migrate(&[], due + 2).unwrap();
+        assert_eq!(loaded, reopened);
     }
 
     #[test]

@@ -1,42 +1,29 @@
 import * as React from "react"
-import { listen } from "@tauri-apps/api/event"
 
 import type { NativeState } from "@/app/use-native-state"
 import type { Reminder } from "@/app/native-store"
 import { AppError } from "@/components/app-error"
+import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { About } from "@/features/about/about"
 import { Activities } from "@/features/activities/activities"
-import { Onboarding } from "@/features/onboarding/onboarding"
 import { Settings } from "@/features/settings/settings"
 import { isTauri } from "@/lib/tauri"
 
 export function Dashboard({ nativeState }: { nativeState: NativeState }) {
-  const { snapshot, loading, error, command, refresh, clearError } = nativeState
+  const {
+    snapshot,
+    loading,
+    error,
+    command,
+    refresh,
+    clearError,
+    requestedDashboardTab,
+    clearRequestedDashboardTab,
+  } = nativeState
   const [uiError, setUiError] = React.useState<string | null>(null)
   const [busy, setBusy] = React.useState(false)
   const [tab, setTab] = React.useState("activities")
-
-  React.useEffect(() => {
-    if (!isTauri()) return
-    let disposed = false
-    let unsubscribe: (() => void) | undefined
-    void listen<string>("sela://dashboard-tab", (event) => {
-      if (["activities", "settings", "about"].includes(event.payload))
-        setTab(event.payload)
-    })
-      .then((unlisten) => {
-        if (disposed) unlisten()
-        else unsubscribe = unlisten
-      })
-      .catch((failure: unknown) =>
-        console.error("Dashboard navigation unavailable", failure)
-      )
-    return () => {
-      disposed = true
-      unsubscribe?.()
-    }
-  }, [])
 
   const run = React.useCallback(
     async <T,>(name: string, args?: Record<string, unknown>) => {
@@ -76,24 +63,6 @@ export function Dashboard({ nativeState }: { nativeState: NativeState }) {
         </p>
       </main>
     )
-  const browserDashboardPreview =
-    import.meta.env.DEV &&
-    new URLSearchParams(window.location.search).get("preview") === "dashboard"
-  if (!snapshot.settings.onboardingCompleted && !browserDashboardPreview)
-    return (
-      <Onboarding
-        error={
-          uiError ??
-          error ??
-          snapshot.storageError ??
-          snapshot.shortcutError ??
-          snapshot.deliveryError
-        }
-        snapshot={snapshot}
-        command={run}
-        onError={setUiError}
-      />
-    )
 
   const blocked = Boolean(snapshot.storageError)
   const changeReminder = (
@@ -113,9 +82,13 @@ export function Dashboard({ nativeState }: { nativeState: NativeState }) {
     <main className="min-h-svh bg-background">
       <Tabs
         className="min-h-svh gap-0"
-        value={tab}
+        value={requestedDashboardTab ?? tab}
         onValueChange={(value) => {
-          if (typeof value === "string") setTab(value)
+          if (typeof value === "string") {
+            setTab(value)
+            if (requestedDashboardTab)
+              clearRequestedDashboardTab(requestedDashboardTab)
+          }
         }}
         orientation="horizontal"
       >
@@ -141,8 +114,8 @@ export function Dashboard({ nativeState }: { nativeState: NativeState }) {
           ) : null}
           {snapshot.storageError ? (
             <AppError
-              title="Reminders are read-only"
-              message={snapshot.storageError}
+              title="Reminders couldn't be opened"
+              message={`${snapshot.storageError} Sela couldn't load your reminders. Resolve the storage problem and reopen Sela.`}
             />
           ) : null}
           {snapshot.shortcutError ? (
@@ -153,34 +126,42 @@ export function Dashboard({ nativeState }: { nativeState: NativeState }) {
           ) : null}
           {snapshot.deliveryError ? (
             <AppError
-              title="Your reminder is still in Activities"
+              title="An alert couldn't be delivered"
               message={snapshot.deliveryError}
               onRetry={() =>
                 void run("retry_failed_deliveries").catch(() => undefined)
               }
             />
           ) : null}
-          {error ? (
-            <AppError
-              title="Sela couldn't refresh"
-              message={error}
-              onRetry={() => {
-                clearError()
-                void refresh()
-              }}
-            />
+          {error && error !== uiError ? (
+            <div className="mb-4">
+              <AppError title="Sela needs attention" message={error} />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  clearError()
+                  void refresh()
+                }}
+              >
+                Refresh reminders
+              </Button>
+            </div>
           ) : null}
           {uiError ? <AppError message={uiError} /> : null}
           <TabsContent value="activities">
-            <Activities
-              command={command}
-              disabled={busy || blocked || !isTauri()}
-              reminders={snapshot.reminders}
-              onNewReminder={() =>
-                void run("show_capture").catch(() => undefined)
-              }
-              onChange={changeReminder}
-            />
+            {!blocked && (
+              <Activities
+                command={command}
+                disabled={busy || !isTauri()}
+                suppressedReminderIds={snapshot.suppressedReminderIds}
+                reminders={snapshot.reminders}
+                onNewReminder={() =>
+                  void run("show_capture").catch(() => undefined)
+                }
+                onChange={changeReminder}
+              />
+            )}
           </TabsContent>
           <TabsContent value="settings">
             <Settings

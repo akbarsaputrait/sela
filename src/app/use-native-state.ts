@@ -25,6 +25,7 @@ export function useNativeState() {
     ...state,
     command,
     refresh: () => nativeStore.refresh(),
+    clearRequestedDashboardTab: nativeStore.clearRequestedDashboardTab,
     clearError: () => nativeStore.clearError(),
   }
 }

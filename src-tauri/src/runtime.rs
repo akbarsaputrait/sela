@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, Notify};
 
@@ -15,6 +16,7 @@ pub struct Snapshot {
     pub revision: u64,
     pub document_revision: u64,
     pub reminders: Vec<Reminder>,
+    pub suppressed_reminder_ids: Vec<String>,
     pub settings: crate::domain::Settings,
     pub active_id: Option<String>,
     pub alert_token: u64,
@@ -33,7 +35,7 @@ pub struct DeliveryState {
     pub preview: bool,
     pub suppressed: HashSet<String>,
     pub failed_deliveries: HashSet<String>,
-    pub next_delivery_at: u64,
+    pub next_delivery_at: Option<Instant>,
     pub notified_token: u64,
     pub presented_token: u64,
     #[cfg(debug_assertions)]
@@ -52,6 +54,7 @@ pub struct RuntimeState {
     pub launch_at_login: bool,
     pub ready_windows: HashSet<String>,
     pub capture_requested: bool,
+    pub requested_dashboard_tab: Option<String>,
 }
 
 enum MutationGuard {
@@ -97,6 +100,7 @@ impl AppRuntime {
                 launch_at_login,
                 ready_windows: HashSet::new(),
                 capture_requested: false,
+                requested_dashboard_tab: None,
             }),
             mutation_gate: Mutex::new(()),
             scheduler_notify: Notify::new(),
@@ -136,6 +140,18 @@ impl AppRuntime {
             revision: state.revision,
             document_revision: state.document_revision,
             reminders,
+            suppressed_reminder_ids: if window == "main" {
+                let mut ids = state
+                    .delivery
+                    .suppressed
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            } else {
+                Vec::new()
+            },
             settings: state.document.settings.clone(),
             active_id: state.delivery.active_id.clone(),
             alert_token: state.delivery.alert_token,
@@ -227,6 +243,19 @@ impl AppRuntime {
         T: Send + 'static,
         F: FnOnce(&mut Document) -> Result<T, String> + Send + 'static,
     {
+        self.mutate_with_sound(guard, None, transition).await
+    }
+
+    async fn mutate_with_sound<T, F>(
+        &self,
+        guard: Option<MutationGuard>,
+        sound: Option<Vec<u8>>,
+        transition: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Document) -> Result<T, String> + Send + 'static,
+    {
         let _gate = self.mutation_gate.lock().await;
         let (before, mut next, base_revision, blocked) = {
             let state = self
@@ -252,13 +281,16 @@ impl AppRuntime {
         let changed_ids = changed_reminder_ids(&before, &next);
         let storage = Arc::clone(&self.storage);
         let persisted = next.clone();
-        tauri::async_runtime::spawn_blocking(move || storage.save_transition(&before, &persisted))
-            .await
-            .map_err(|error| {
-                log::error!("storage worker failed: {error}");
-                "That didn't save. Your reminders are unchanged. Please try again.".to_string()
-            })?
-            .map_err(|error| error.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || match sound {
+            Some(bytes) => storage.save_sound_transition(&before, &persisted, &bytes),
+            None => storage.save_transition(&before, &persisted),
+        })
+        .await
+        .map_err(|error| {
+            log::error!("storage worker failed: {error}");
+            "That didn't save. Your reminders are unchanged. Please try again.".to_string()
+        })?
+        .map_err(|error| error.to_string())?;
 
         let mut state = self
             .state
@@ -290,7 +322,31 @@ impl AppRuntime {
         Ok(result)
     }
 
+    pub async fn upload_custom_sound(&self, bytes: Vec<u8>) -> Result<String, String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.mutate_with_sound(None, Some(bytes), move |document| {
+            document.settings.sound_choice = crate::domain::SoundChoice::Custom;
+            document.settings.custom_sound_id = Some(id.clone());
+            Ok(id)
+        })
+        .await
+    }
+
+    pub async fn get_custom_sound(&self, id: String) -> Result<Vec<u8>, String> {
+        let storage = Arc::clone(&self.storage);
+        tauri::async_runtime::spawn_blocking(move || storage.read_custom_sound(&id))
+            .await
+            .map_err(|error| {
+                log::error!("sound worker failed: {error}");
+                "That sound is unavailable. Upload it again.".to_string()
+            })?
+    }
+
     pub async fn reconcile_due(&self, now: u64) -> bool {
+        self.reconcile_due_at(now, Instant::now()).await
+    }
+
+    async fn reconcile_due_at(&self, now: u64, monotonic_now: Instant) -> bool {
         let _gate = self.mutation_gate.lock().await;
         let mut state = self
             .state
@@ -298,7 +354,10 @@ impl AppRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.storage_error.is_some()
             || state.delivery.active_id.is_some()
-            || state.delivery.next_delivery_at > now
+            || state
+                .delivery
+                .next_delivery_at
+                .is_some_and(|until| until > monotonic_now)
         {
             return false;
         }
@@ -374,7 +433,12 @@ impl AppRuntime {
         true
     }
 
-    pub async fn handoff_native_notification(&self, token: u64, now: u64) {
+    pub async fn handoff_native_notification(&self, token: u64) {
+        self.handoff_native_notification_at(token, Instant::now())
+            .await;
+    }
+
+    async fn handoff_native_notification_at(&self, token: u64, now: Instant) {
         let _gate = self.mutation_gate.lock().await;
         let mut state = self
             .state
@@ -387,7 +451,10 @@ impl AppRuntime {
         if let Some(id) = state.delivery.active_id.take() {
             state.delivery.suppressed.insert(id);
         }
-        state.delivery.next_delivery_at = now.saturating_add(5_000);
+        state.delivery.next_delivery_at = Some(now + Duration::from_secs(5));
+        if state.delivery.failed_deliveries.is_empty() {
+            state.delivery_error = None;
+        }
         state.delivery.alert_token += 1;
         state.revision += 1;
         drop(state);
@@ -395,7 +462,12 @@ impl AppRuntime {
     }
 
     /// Failed delivery never pins the queue forever: keep the item due and continue after a brief pause.
-    pub async fn fail_active_delivery(&self, token: u64, message: String, now: u64) {
+    pub async fn fail_active_delivery(&self, token: u64, message: String) {
+        self.fail_active_delivery_at(token, message, Instant::now())
+            .await;
+    }
+
+    async fn fail_active_delivery_at(&self, token: u64, message: String, now: Instant) {
         let _gate = self.mutation_gate.lock().await;
         let mut state = self
             .state
@@ -410,14 +482,14 @@ impl AppRuntime {
             state.delivery.suppressed.insert(id.clone());
             state.delivery.failed_deliveries.insert(id);
         }
-        state.delivery.next_delivery_at = now.saturating_add(3_000);
+        state.delivery.next_delivery_at = Some(now + Duration::from_secs(3));
         state.delivery.alert_token += 1;
         state.revision += 1;
         drop(state);
         self.scheduler_notify.notify_one();
     }
 
-    pub async fn retry_failed_deliveries(&self, now: u64) {
+    pub async fn retry_failed_deliveries(&self) {
         let _gate = self.mutation_gate.lock().await;
         let mut state = self
             .state
@@ -426,7 +498,7 @@ impl AppRuntime {
         for id in std::mem::take(&mut state.delivery.failed_deliveries) {
             state.delivery.suppressed.remove(&id);
         }
-        state.delivery.next_delivery_at = now;
+        state.delivery.next_delivery_at = None;
         state.delivery_error = None;
         state.revision += 1;
         drop(state);
@@ -471,6 +543,10 @@ impl AppRuntime {
 
     /// Recheck at least every 30 seconds for wall-clock changes while sleeping between deadlines.
     pub fn next_scheduler_delay(&self, now: u64) -> std::time::Duration {
+        self.next_scheduler_delay_at(now, Instant::now())
+    }
+
+    fn next_scheduler_delay_at(&self, now: u64, monotonic_now: Instant) -> Duration {
         const MAX_RECHECK_MS: u64 = 30_000;
         let state = self
             .state
@@ -479,10 +555,10 @@ impl AppRuntime {
         if state.delivery.active_id.is_some() {
             return std::time::Duration::from_millis(MAX_RECHECK_MS);
         }
-        if state.delivery.next_delivery_at > now {
-            return std::time::Duration::from_millis(
-                (state.delivery.next_delivery_at - now).min(MAX_RECHECK_MS),
-            );
+        if let Some(until) = state.delivery.next_delivery_at
+            && until > monotonic_now
+        {
+            return (until - monotonic_now).min(Duration::from_millis(MAX_RECHECK_MS));
         }
         let next_due = state
             .document
@@ -529,6 +605,21 @@ impl AppRuntime {
     #[cfg(debug_assertions)]
     pub fn database_path(&self) -> std::path::PathBuf {
         self.storage.path().to_path_buf()
+    }
+
+    pub fn request_dashboard_tab(&self, tab: &str) {
+        self.state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .requested_dashboard_tab = Some(tab.to_owned());
+    }
+
+    pub fn take_requested_dashboard_tab(&self) -> Option<String> {
+        self.state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .requested_dashboard_tab
+            .take()
     }
 
     pub fn mark_window_ready(&self, label: &str) -> bool {
@@ -669,6 +760,171 @@ mod tests {
     use crate::{domain::ReminderStatus, storage::unix_timestamp};
 
     #[test]
+    fn dashboard_navigation_retains_latest_request_until_consumed() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = AppRuntime::new(
+            Document::default(),
+            AppStorage::new(directory.path().join("sela.sqlite3")),
+            None,
+            false,
+        );
+        assert_eq!(runtime.take_requested_dashboard_tab(), None);
+        runtime.request_dashboard_tab("settings");
+        runtime.request_dashboard_tab("about");
+        assert_eq!(
+            runtime.take_requested_dashboard_tab().as_deref(),
+            Some("about")
+        );
+        assert_eq!(runtime.take_requested_dashboard_tab(), None);
+    }
+
+    #[tokio::test]
+    async fn delivery_cooldowns_ignore_wall_clock_jumps_without_sleeping() {
+        for failed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut document = Document::default();
+            let first = document.create("first", Some(1_000), 100).unwrap();
+            let second = document.create("second", Some(1_000), 101).unwrap();
+            let runtime = AppRuntime::new(
+                document,
+                AppStorage::new(directory.path().join("sela.sqlite3")),
+                None,
+                false,
+            );
+            let clock = Instant::now();
+            assert!(runtime.reconcile_due_at(1_101, clock).await);
+            assert_eq!(
+                runtime.snapshot().active_id.as_deref(),
+                Some(first.as_str())
+            );
+            let token = runtime.snapshot().alert_token;
+            let cooldown = Duration::from_secs(if failed { 3 } else { 5 });
+            if failed {
+                runtime
+                    .fail_active_delivery_at(token, "unavailable".into(), clock)
+                    .await;
+            } else {
+                runtime.handoff_native_notification_at(token, clock).await;
+            }
+            // A large forward wall-clock jump cannot bypass a transient delay.
+            assert!(
+                !runtime
+                    .reconcile_due_at(9_000_000_000, clock + cooldown - Duration::from_millis(1))
+                    .await
+            );
+            assert_eq!(
+                runtime.next_scheduler_delay_at(9_000_000_000, clock + Duration::from_secs(1)),
+                cooldown - Duration::from_secs(1),
+            );
+            // A backward wall-clock jump cannot extend the delay.
+            assert!(runtime.reconcile_due_at(1_101, clock + cooldown).await);
+            assert_eq!(
+                runtime.snapshot().active_id.as_deref(),
+                Some(second.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_replacement_rejects_stale_edits_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sela.sqlite3");
+        let mut document = Document::default();
+        let id = document.create("old", Some(1_000), 100).unwrap();
+        let runtime = AppRuntime::new(document, AppStorage::new(path.clone()), None, false);
+        let transition_id = id.clone();
+        runtime
+            .mutate_occurrence_reminder(id.clone(), 0, move |document| {
+                document
+                    .edit_timer(&transition_id, "new", Some(5_000), 200)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        let changed = runtime.snapshot().reminders[0].clone();
+        let transition_id = id.clone();
+        assert!(
+            runtime
+                .mutate_occurrence_reminder(id, 0, move |document| {
+                    document
+                        .edit_timer(&transition_id, "stale", None, 300)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.snapshot().reminders[0], changed);
+        drop(runtime);
+        let storage = AppStorage::new(path);
+        let loaded = storage.load_or_migrate(&[], 400).unwrap();
+        assert_eq!(loaded.reminders[0], changed);
+        let restarted = AppRuntime::new(loaded, storage, None, false);
+        assert!(!restarted.reconcile_due(5_199).await);
+        assert!(restarted.reconcile_due(5_200).await);
+    }
+
+    #[tokio::test]
+    async fn exhausted_recurrence_history_and_explicit_deletion_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sela.sqlite3");
+        let now = 1_735_689_600_000;
+        let schedule = serde_json::from_str(r#"{"kind":"daily","date":"2025-01-01","time":"09:00","weekdays":[],"dates":[],"endDate":"2025-01-02","timeZone":"UTC"}"#).unwrap();
+        let mut document = Document::default();
+        let id = document
+            .create_scheduled("two days", schedule, now)
+            .unwrap();
+        let pending = document.create("keep pending", None, now).unwrap();
+        let first_due = document.reminders[0].due_at.unwrap();
+        let storage = AppStorage::new(path.clone());
+        storage
+            .save_transition(&Document::default(), &document)
+            .unwrap();
+        let runtime = AppRuntime::new(document, storage, None, false);
+        for (revision, due) in [(0, first_due), (1, first_due + 86_400_000)] {
+            let transition_id = id.clone();
+            runtime
+                .mutate_occurrence_reminder(id.clone(), revision, move |document| {
+                    document
+                        .resolve(&transition_id, ReminderStatus::Completed, due)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap();
+        }
+        drop(runtime);
+        let storage = AppStorage::new(path.clone());
+        let loaded = storage
+            .load_or_migrate(&[], first_due + 2 * 86_400_000)
+            .unwrap();
+        let completed = loaded
+            .reminders
+            .iter()
+            .find(|reminder| reminder.id == id)
+            .unwrap();
+        assert_eq!(completed.status, ReminderStatus::Completed);
+        assert_eq!(
+            completed.occurrence_history,
+            vec![first_due, first_due + 86_400_000]
+        );
+        let runtime = AppRuntime::new(loaded, storage, None, false);
+        assert!(!runtime.reconcile_due(first_due + 2 * 86_400_000).await);
+        assert_eq!(
+            runtime
+                .mutate_document(|document| Ok(document.clear_resolved_history()))
+                .await
+                .unwrap(),
+            1
+        );
+        drop(runtime);
+        let loaded = AppStorage::new(path)
+            .load_or_migrate(&[], first_due + 3 * 86_400_000)
+            .unwrap();
+        assert_eq!(loaded.reminders.len(), 1);
+        assert_eq!(loaded.reminders[0].id, pending);
+        assert_eq!(loaded.reminders[0].status, ReminderStatus::Pending);
+    }
+
+    #[test]
     fn changed_reminder_ids_include_modified_and_removed_rows_only() {
         let mut before = Document::default();
         let first = before.create("first", None, 100).unwrap();
@@ -698,6 +954,17 @@ mod tests {
         assert_eq!(alert.reminders.len(), 1);
         assert_eq!(alert.reminders[0].id, id);
         assert_eq!(runtime.snapshot_for("main").reminders.len(), 2);
+        runtime.dismiss_alert(alert.alert_token).await.unwrap();
+        assert_eq!(
+            runtime.snapshot_for("main").suppressed_reminder_ids,
+            vec![id]
+        );
+        assert!(
+            runtime
+                .snapshot_for("capture")
+                .suppressed_reminder_ids
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -828,6 +1095,7 @@ mod tests {
         let first = document.create("first", Some(1_000), 100).unwrap();
         let second = document.create("second", Some(2_000), 100).unwrap();
         let runtime = AppRuntime::new(document, storage, None, false);
+        let clock = Instant::now();
         assert!(runtime.reconcile_due(2_100).await);
         assert_eq!(
             runtime.snapshot().active_id.as_deref(),
@@ -835,10 +1103,14 @@ mod tests {
         );
         let token = runtime.snapshot().alert_token;
         runtime
-            .fail_active_delivery(token, "banner unavailable".into(), 2_100)
+            .fail_active_delivery_at(token, "banner unavailable".into(), clock)
             .await;
-        assert!(!runtime.reconcile_due(2_101).await);
-        assert!(runtime.reconcile_due(5_101).await);
+        assert!(!runtime.reconcile_due_at(2_101, clock).await);
+        assert!(
+            runtime
+                .reconcile_due_at(5_101, clock + Duration::from_secs(3))
+                .await
+        );
         assert_eq!(
             runtime.snapshot().active_id.as_deref(),
             Some(second.as_str())
@@ -850,7 +1122,7 @@ mod tests {
         );
         let snapshot = runtime.snapshot();
         runtime.dismiss_alert(snapshot.alert_token).await.unwrap();
-        runtime.retry_failed_deliveries(5_102).await;
+        runtime.retry_failed_deliveries().await;
         assert!(runtime.snapshot().delivery_error.is_none());
         assert!(runtime.reconcile_due(5_102).await);
         assert_eq!(
