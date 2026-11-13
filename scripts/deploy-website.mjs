@@ -1,24 +1,19 @@
 import { execFileSync } from "node:child_process"
 import { downloadPath, verifyDMG, websiteURL } from "./release-contract.mjs"
-import { assertLatest, assertReleaseSource, syncDownload } from "./sync-website-download.mjs"
+import { assertLatest, assertMainSource, syncDownload } from "./sync-website-download.mjs"
 
-if (process.env.GITHUB_ACTIONS === "true") {
-  for (const name of ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "SELA_RELEASE_ID"]) {
-    if (!process.env[name]) throw new Error(`Missing required deployment secret/configuration: ${name}`)
-  }
-} else {
-  console.warn("Manual deployments are not serialized with the GitHub Actions website workflow. Avoid concurrent deployments.")
-}
+console.warn("Optional manual deployment: avoid running concurrently with Cloudflare's Git-connected deployments.")
 
+assertMainSource()
 execFileSync("bun", ["run", "build:website"], { stdio: "inherit" })
 const { release, asset } = syncDownload()
 assertLatest(release.id)
-assertReleaseSource(release)
-// The website workflow serializes production deployments across release and manual runs.
+assertMainSource()
+// Automatic production deployments belong to the existing Cloudflare Git integration.
 execFileSync("node_modules/.bin/wrangler", ["deploy"], { stdio: "inherit" })
 const url = new URL(downloadPath, `${websiteURL}/`)
 assertLatest(release.id)
-assertReleaseSource(release)
+assertMainSource()
 const response = await fetch(url, { cache: "no-store", headers: { "Cache-Control": "no-cache" } })
 if (!response.ok) throw new Error(`Deployed download returned HTTP ${response.status}: ${url}`)
 if ((response.headers.get("content-type") ?? "").includes("text/html")) {
@@ -28,4 +23,6 @@ verifyDMG(Buffer.from(await response.arrayBuffer()), asset)
 if (!(response.headers.get("cache-control") ?? "").includes("no-store")) {
   throw new Error("Deployed binary URL is missing the required no-store cache policy")
 }
+assertLatest(release.id)
+assertMainSource()
 console.log(`Verified deployed URL bytes and SHA256: ${url}`)

@@ -16,21 +16,26 @@ test("manual and signed builds use Tauri's canonical versioned ARM64 name", () =
   assert.equal(assetName("1.2.3"), "Sela_1.2.3_aarch64.dmg")
   assert.equal(assetName("1.2.3", "x86_64"), "Sela_1.2.3_x64.dmg")
   assert.throws(() => assetName("1.2.3", "universal"))
-  assert.equal(selectAsset(release, "1.2.3", "42"), asset)
   assert.equal(sourceVersion().length > 0, true)
+})
+
+test("website installer version comes from the published release tag, not source manifests", () => {
+  assert.equal(selectAsset(release, "42"), asset)
+  const newerAsset = { ...asset, name: "Sela_2.3.4_aarch64.dmg" }
+  assert.equal(selectAsset({ ...release, tag_name: "v2.3.4", assets: [newerAsset] }), newerAsset)
+  assert.throws(() => selectAsset({ ...release, tag_name: "v2.3.4" }))
 })
 
 test("selection cannot fall through to a different version, arch, tag or release ID", () => {
   for (const name of ["Sela_1.2.2_aarch64.dmg", "Sela_1.2.3_x64.dmg", "Sela-1.2.3-macos-apple-silicon.dmg"]) {
-    assert.throws(() => selectAsset({ ...release, assets: [{ ...asset, name }] }, "1.2.3"))
+    assert.throws(() => selectAsset({ ...release, assets: [{ ...asset, name }] }))
   }
-  assert.throws(() => selectAsset(release, "1.2.4"))
-  assert.throws(() => selectAsset(release, "1.2.3", "43"))
-  assert.throws(() => selectAsset({ ...release, assets: [asset, { ...asset, id: 92 }] }, "1.2.3"))
-  assert.throws(() => selectAsset({ ...release, draft: true }, "1.2.3"))
-  assert.throws(() => selectAsset({ ...release, prerelease: true }, "1.2.3"))
-  assert.throws(() => selectAsset({ ...release, draft: undefined }, "1.2.3"))
-  assert.throws(() => selectAsset({ ...release, prerelease: undefined }, "1.2.3"))
+  assert.throws(() => selectAsset(release, "43"))
+  assert.throws(() => selectAsset({ ...release, assets: [asset, { ...asset, id: 92 }] }))
+  assert.throws(() => selectAsset({ ...release, draft: true }))
+  assert.throws(() => selectAsset({ ...release, prerelease: true }))
+  assert.throws(() => selectAsset({ ...release, draft: undefined }))
+  assert.throws(() => selectAsset({ ...release, prerelease: undefined }))
   for (const tag of ["1.2.3", "v1.2.3-beta.1", "v1.2", "v1.2.3\n", "v1.2.3/other"]) {
     assert.throws(() => releaseVersion(tag))
   }
@@ -49,7 +54,7 @@ test("all source manifests and lockfile must agree before release attachment", (
 
 test("GitHub must supply the uploaded asset size and SHA256 digest", () => {
   for (const override of [{ digest: null }, { digest: "sha256:nope" }, { size: 0 }, { state: "new" }, { id: 0 }]) {
-    assert.throws(() => selectAsset({ ...release, assets: [{ ...asset, ...override }] }, "1.2.3"))
+    assert.throws(() => selectAsset({ ...release, assets: [{ ...asset, ...override }] }))
   }
 })
 
@@ -77,9 +82,14 @@ test("signed releases require the intended Developer ID Application team", () =>
   assert.throws(() => assertDeveloperID(signature, undefined))
 })
 
-test("website source must be the exact pushed release-tag commit", () => {
-  const commit = "a".repeat(40)
-  assert.doesNotThrow(() => assertSourceCommit(commit, commit))
-  assert.throws(() => assertSourceCommit(commit, "b".repeat(40)))
-  assert.throws(() => assertSourceCommit("invalid", "invalid"))
+test("website source is current main and the immutable resolved SHA, never an older release tag", () => {
+  const main = "a".repeat(40)
+  const older = "b".repeat(40)
+  assert.doesNotThrow(() => assertSourceCommit(main, main))
+  assert.doesNotThrow(() => assertSourceCommit(main, main, main))
+  assert.throws(() => assertSourceCommit(older, main, older))
+  assert.throws(() => assertSourceCommit(older, main, main))
+  assert.throws(() => assertSourceCommit(main, main, older))
+  assert.throws(() => assertSourceCommit(main, main, "invalid"))
+  assert.throws(() => assertSourceCommit("invalid", "invalid", "invalid"))
 })

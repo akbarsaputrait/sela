@@ -1,0 +1,100 @@
+name: Automatic app draft
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Retry an existing pushed ad-hoc tag (vMAJOR.MINOR.PATCH); never overwrite assets
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automatic-app-draft
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      release_needed: ${{ steps.release.outputs.release_needed }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: gh auth setup-git
+      - name: Classify unreleased app changes or validate an explicit retry
+        id: release
+        env:
+          RETRY: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          if [[ "$RETRY" == "true" ]]; then
+            node scripts/auto-release.mjs --retry
+          else
+            node scripts/auto-release.mjs --plan
+          fi
+
+  draft:
+    needs: plan
+    if: needs.plan.outputs.release_needed == 'true'
+    name: Build verified ad-hoc Apple Silicon draft
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+      RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+      - run: bun install --frozen-lockfile
+      - run: gh auth setup-git
+      - name: Prepare version-only commit and push its immutable tag, never main
+        if: github.event_name == 'workflow_run'
+        run: node scripts/auto-release.mjs --prepare
+      - name: Validate the exact pushed tag and synchronized versions
+        run: node scripts/prepare-release.mjs --validate
+      - run: bun run test:distribution
+      - name: Build, verify, and attach to a draft (manual Publish)
+        run: bun run release:manual

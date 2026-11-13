@@ -2,7 +2,19 @@
 
 Sela targets macOS 14+ on Apple Silicon and Intel. Release scripts attach artifacts to a **draft**; a person must review and publish it. An ad-hoc build is not Developer ID signed or notarized and Gatekeeper may warn users. Do not describe it as a signed production release.
 
-## Before tagging
+## Automatic app-only ad-hoc draft
+
+After a successful `CI` **push** run on current `main`, `Automatic app draft` compares the tested source against the source behind the newest stable version tag. PR CI, failed/cancelled CI and stale main commits cannot create an automatic app release. App changes accumulate since the last tagged source, not just the last merge; an existing draft or reserved tag is already a baseline even before publication. A landing-only diff from that baseline does not create an app release.
+
+Application source, native code/configuration, shared public assets and app build configuration count as app changes. Package and Bun lockfile changes are inspected semantically: runtime/shared build dependencies count, including their resolved transitive dependencies; website-only Sharp/Wrangler changes, OG assets, landing code, documentation and release automation do not. A dependency graph the detector cannot safely understand fails the workflow instead of silently skipping a release.
+
+The workflow reserves the next patch above existing stable tags, or respects a higher version explicitly aligned in all four source manifests. It creates a detached version-only release commit when needed, pushes only its immutable `vMAJOR.MINOR.PATCH` tag, and builds the existing verified ad-hoc Apple Silicon draft. It never writes to protected `main`, bypasses PR rules, publishes a release, notarizes the app, or creates an Intel artifact. Source versions on `main` may therefore be older than automatic release tags; the installer and tagged manifests contain the actual release version.
+
+Automatic packaging runs directly in the workflow: tags pushed with `GITHUB_TOKEN` do not trigger another push workflow. Existing Developer ID release automation remains separate and unchanged.
+
+Review the installer, draft notes and Gatekeeper warning, then click **Publish release** yourself. A packaging failure can leave a reserved tag without a complete draft. To retry, dispatch **Automatic app draft** on `main` with that existing tag; this builds its exact tagged source without bumping again. It never overwrites an existing asset or changes a published release. Review and explicitly remove an incorrect draft asset before retrying. Rerunning automatic change detection does not create a second draft for already tagged source.
+
+## Before manual tagging
 
 1. Run `bun run check` and `bun run test:distribution`. The distribution tests are offline and do not need Apple or Cloudflare credentials.
 2. Run `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`, `cargo test --manifest-path src-tauri/Cargo.toml`, and `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`.
@@ -37,11 +49,11 @@ Keep credentials in GitHub Actions Secrets, not in the repository, `.env`, artif
 
 ## Website deployment
 
-Publishing a stable release triggers the serialized website workflow; it can also be dispatched manually. Configure `CLOUDFLARE_API_TOKEN` as a secret and `CLOUDFLARE_ACCOUNT_ID` as a variable in the `website` environment. The token must have the minimum permissions required to deploy the existing `sela` Worker and its assets. Preserve the existing Worker and custom-domain routing; validate Cloudflare dashboard-managed routes against the deployment configuration before enabling automation.
+Production website deployments are handled by the existing Cloudflare Git integration connected to `main`, independently of application releases. There is no GitHub Actions website deployment workflow, and no Cloudflare deployment token or account ID needs to be added to GitHub. Keep the existing Cloudflare dashboard build/deploy settings, Worker and custom-domain routing unchanged.
 
-The workflow resolves GitHub's latest stable release, checks out its tag, checks source versions and tag commit, selects the one exact ARM64 asset by immutable ID, and verifies its GitHub SHA-256 digest, size and DMG envelope. It rechecks latest release and source before deployment and afterwards; then it verifies the actual stable download URL's bytes, digest and no-store cache policy. An older release event is ignored. A newer release published during an in-flight deployment can make that run fail its post-deploy check; ensure the newer release's workflow completes successfully.
+`bun run build:website` builds the landing page and regenerates its OG image without Cloudflare deployment credentials. Installer synchronization is not part of this build command. Publishing an app release does not push `main` and therefore does not itself trigger a Git-connected website rebuild; manage any required rebuild through the existing Cloudflare integration.
 
-For a manual deployment, check out the latest release tag with matching source, authenticate GitHub CLI and Wrangler, and run `bun run deploy:website`. Manual deployments are not serialized with the GitHub Actions workflow; avoid running both at the same time. Direct `wrangler deploy` bypasses the integrity checks.
+The optional local `bun run deploy:website` helper remains separate from automatic Cloudflare builds. To use it, check out current `main` in a clean working tree and authenticate GitHub CLI and Wrangler locally. It verifies the latest published stable installer by immutable asset ID, SHA-256, size and DMG envelope, checks source/release staleness, then validates the served download and no-store policy. Do not run it concurrently with a Cloudflare-managed deployment. Direct `wrangler deploy` bypasses these installer checks.
 
 ## Not enabled
 

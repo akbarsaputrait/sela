@@ -36,14 +36,15 @@ export function assetName(version, arch = "aarch64") {
   return `Sela_${version}_${arch === "x86_64" ? "x64" : arch}.dmg`
 }
 
-export function selectAsset(release, version, expectedID) {
+export function selectAsset(release, expectedID) {
   if (!Number.isSafeInteger(release.id) || release.id <= 0 ||
       (expectedID !== undefined && String(release.id) !== String(expectedID))) {
     throw new Error("Release ID does not match the requested release")
   }
-  if (release.draft !== false || release.prerelease !== false || releaseVersion(release.tag_name) !== version) {
-    throw new Error("Only the exact published stable source version can be deployed")
+  if (release.draft !== false || release.prerelease !== false) {
+    throw new Error("Only a published stable release can be deployed")
   }
+  const version = releaseVersion(release.tag_name)
   const matches = release.assets.filter((asset) => asset.name === assetName(version))
   if (matches.length !== 1) throw new Error(`Expected exactly one ${assetName(version)} asset`)
   const asset = matches[0]
@@ -74,8 +75,8 @@ export function assertDeveloperID(signature, teamID) {
   }
 }
 
-export function assertSourceCommit(head, published) {
-  if (!/^[a-f0-9]{40}$/.test(head) || head !== published) {
-    throw new Error("Website source HEAD must match the release's pushed tag commit")
+export function assertSourceCommit(head, currentMain, expected = head) {
+  if (!/^[a-f0-9]{40}$/.test(head) || head !== currentMain || head !== expected) {
+    throw new Error("Website source HEAD must match current main and the resolved deployment source")
   }
 }

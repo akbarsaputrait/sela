@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process"
 import { mkdirSync, writeFileSync } from "node:fs"
 import { pathToFileURL } from "node:url"
-import { assertSourceCommit, downloadPath, repository, selectAsset, sourceVersion, verifyDMG } from "./release-contract.mjs"
+import { assertSourceCommit, downloadPath, repository, selectAsset, verifyDMG } from "./release-contract.mjs"
 
 export function githubJSON(endpoint) {
   return JSON.parse(execFileSync("gh", ["api", `repos/${repository}/${endpoint}`], { encoding: "utf8" }))
@@ -17,19 +17,18 @@ export function assertLatest(releaseID) {
   }
 }
 
-export function assertReleaseSource(release) {
+export function assertMainSource(expectedSHA = process.env.SELA_WEBSITE_SOURCE_SHA) {
   const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim()
-  const published = githubJSON(`commits/${release.tag_name}`)
-  assertSourceCommit(head, published.sha)
+  const main = githubJSON("git/ref/heads/main")
+  assertSourceCommit(head, main.object.sha, expectedSHA)
 }
 
 export function syncDownload() {
-  const version = sourceVersion()
   const expectedID = process.env.SELA_RELEASE_ID
   if (expectedID && !/^[1-9]\d*$/.test(expectedID)) throw new Error("SELA_RELEASE_ID must be a numeric release ID")
   const release = expectedID ? githubJSON(`releases/${expectedID}`) : latestRelease()
-  const asset = selectAsset(release, version, expectedID)
-  assertReleaseSource(release)
+  const asset = selectAsset(release, expectedID)
+  assertMainSource()
   assertLatest(release.id)
   // The API asset ID is immutable for this request; never resolve a tag/glob a second time.
   const bytes = execFileSync("gh", ["api", "--header", "Accept: application/octet-stream",

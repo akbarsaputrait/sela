@@ -46,6 +46,17 @@ bun run tauri dev
 
 Builds made without an Apple Developer account are ad-hoc signed, not notarized. If you share one, macOS may require a manual approval to open it. See [Updating Sela](docs/updating.md) for safe backup and update steps.
 
+## Website social preview
+
+The landing page includes static Open Graph and X/Twitter card metadata in `website/index.html`. Its 1200×630 PNG is `public/og-image.png`, generated from the existing Sela icon and an editable SVG design inside `scripts/generate-og-image.mjs`.
+
+```bash
+bun run og:generate
+bun run build:website
+```
+
+Website builds regenerate the image automatically. The public image URL is `https://sela.akbarsaputrait.tech/og-image.png`; metadata and the image become live after deploying the website. This is a link-sharing preview, not an additional visible section on the landing page.
+
 ## Your reminders stay close
 
 Reminders and settings live in a local database on your Mac. Sela cannot wake a sleeping or powered-off Mac, but overdue reminders are surfaced when Sela resumes or opens again. Native notifications follow macOS notification permissions and Focus settings.
