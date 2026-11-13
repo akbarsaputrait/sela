@@ -5,6 +5,8 @@
 ### Added
 - Add a branded 1200×630 social preview image, Open Graph metadata, and an X/Twitter large-image card to the landing page.
 - Regenerate the social image locally with `bun run og:generate` and automatically during website builds.
+- Create verified ad-hoc Apple Silicon draft releases after successful main CI only when application code or its dependency graph changes, with automatic patch tags and protected-main preservation.
+- Deploy landing-page changes from main independently, keeping downloads pinned to the latest verified published stable installer.
 
 ## [1.1.0] - 2026-11-04
 
