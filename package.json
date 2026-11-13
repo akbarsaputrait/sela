@@ -3,6 +3,7 @@
   "private": true,
   "version": "1.1.0",
   "type": "module",
+  "packageManager": "bun@1.4.4",
   "scripts": {
     "dev": "node init.cjs && vite",
     "dev:website": "node init.cjs && vite --config vite.website.config.ts",

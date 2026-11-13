@@ -22,7 +22,7 @@ jobs:
   publish-tauri:
     if: ${{ vars.APPLE_RELEASE_ENABLED == 'true' }}
     name: Build and verify both macOS installers before attachment
-    runs-on: macos-14
+    runs-on: macos-15
     environment: release
     permissions:
       contents: write
@@ -39,7 +39,7 @@ jobs:
         run: node scripts/prepare-release.mjs --validate
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
