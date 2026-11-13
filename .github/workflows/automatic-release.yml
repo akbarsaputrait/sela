@@ -45,7 +45,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: gh auth setup-git
       - name: Classify unreleased app changes or validate an explicit retry
@@ -64,7 +64,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.release_needed == 'true'
     name: Build verified ad-hoc Apple Silicon draft
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     permissions:
       contents: write
@@ -80,7 +80,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable

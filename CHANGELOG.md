@@ -8,6 +8,10 @@
 - Create verified ad-hoc Apple Silicon draft releases after successful main CI only when application code or its dependency graph changes, with automatic patch tags and protected-main preservation.
 - Keep landing-page deployments in the existing Cloudflare Git integration, separate from automatic application drafts.
 
+### Fixed
+- Pin Bun 1.4.4 for Cloudflare dependency installation and GitHub builds so the version-2 lockfile is supported.
+- Replace retired macOS 14 CI/release runners with supported macOS 15 runners.
+
 ## [1.1.0] - 2026-11-04
 
 ### Improved
